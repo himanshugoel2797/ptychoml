@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pixi/
+pixi.lock
+.pytest_cache/
+dist/
+build/
+*.engine
+*.onnx
+.env
+.vscode/
+.idea/
+*.swp
+*.swo
