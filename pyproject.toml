@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "ptychoml"
 version = "0.1.0"
 requires-python = ">=3.12"
+license = {file = "LICENSE"}
 
 [project.scripts]
 ptychoml-build-engine = "ptychoml.cli:main"
