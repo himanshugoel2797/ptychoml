@@ -97,6 +97,7 @@ from ptychoml import (
     fourier_shift,
     inpaint_bad_pixels,
     mask_hot_pixels,
+    mask_saturated_pixels,
     normalize_intensity,
     resize_diffraction_patterns,
     rm_outlier_pixels,
@@ -115,20 +116,46 @@ will be deduped in a follow-up once call sites are unified.
 `cupy` arrays. Functions that use `scipy.fft` / `scipy.ndimage`
 (`fourier_shift`, `find_outlier_pixels`) remain numpy-only for now.
 
+Functions are grouped into four families so variants can be evaluated
+side-by-side. The same grouping is used in
+[`ptychoml/preprocess.py`](ptychoml/preprocess.py).
+
+### 1. ROI detection
+
+Find where the signal lives in a frame; these return coordinates and do
+not modify the input. Pair them with `crop_to_roi` to actually crop.
+
+| Function | Purpose |
+|---|---|
+| `auto_detect_roi_offsets(frames, nx, ny)` | Center an `nx × ny` crop on the diffraction-pattern center of mass after masking saturated pixels. Returns `(bx0, by0)`. |
+| `estimate_roi(image, threshold=0.1)` | Variant using normalized intensity projections and edge-of-signal detection instead of COM. Returns `(x0, y0, w, h)`. |
+
+### 2. Crop / pad / resize
+
+Change the spatial extent of frames. Three variants by use case.
+
 | Function | Purpose |
 |---|---|
 | `crop_to_roi(arr, roi)` | Crop the last two axes to a fixed `[[y0, y1], [x0, x1]]` window. Use when the crop region is calibrated and identical for every frame. |
-| `resize_diffraction_patterns(dp, target_n)` | Crop each pattern around its per-frame argmax or zero-pad to `target_n × target_n`. Mask hot pixels first if the detector has saturated outliers. |
-| `auto_detect_roi_offsets(frames, nx, ny)` | Center an `nx × ny` crop on the diffraction-pattern center of mass after masking saturated pixels. |
-| `mask_hot_pixels(arr, threshold, fill=0.0)` | Replace values above `threshold` with `fill` (saturated/dead-pixel masking). **Mutates in place** and returns `arr`. |
+| `zero_pad_to_target(image, target_size)` | Strict centered zero-pad of a 2D image to `target_size × target_size`; raises if input is larger. |
+| `resize_diffraction_patterns(dp, target_n)` | Combined per-frame argmax-crop and zero-pad to `target_n × target_n`. Mask hot pixels first if the detector has saturated outliers. |
+
+### 3. Bad-pixel masking, inpainting & threshold cleanup
+
+| Function | Purpose |
+|---|---|
+| `mask_hot_pixels(arr, threshold, fill=0.0)` | Replace values above `threshold` with `fill`. **Mutates in place** and returns `arr`. |
+| `apply_intensity_floor(arr, threshold)` | Zero values strictly below `threshold` (noise-floor cutoff). Symmetric to `mask_hot_pixels`. **Mutates in place.** |
 | `mask_saturated_pixels(arr, fill=0.0)` | Replace dtype-max sentinel values (e.g. `65535` for `uint16`) with `fill`. **Mutates in place.** |
-| `inpaint_bad_pixels(arr, coords, radius=1)` | Replace each `(row, col)` in `coords` with the median of a `(2*radius+1)²` neighborhood. Operates on the last two axes. **Mutates in place** and returns `arr`. |
+| `inpaint_bad_pixels(arr, coords, radius=1)` | Replace each `(row, col)` in `coords` with the median of a `(2*radius+1)²` neighborhood. **Mutates in place.** |
 | `rm_outlier_pixels(data, rows, cols, set_to_zero=False)` | Variant of `inpaint_bad_pixels` taking parallel `rows`/`cols` arrays and a `set_to_zero` flag. **Mutates in place.** |
 | `find_outlier_pixels(data, tolerance=3, worry_about_edges=True, get_fixed_image=False)` | Auto-detect hot/dead pixels via median-filter difference (`> 10·σ`). Returns coords; optionally also returns a fixed copy. |
-| `estimate_roi(image, threshold=0.1)` | Variant of `auto_detect_roi_offsets` using normalized intensity projections and edge-of-signal detection. Returns `(x0, y0, w, h)`. |
-| `zero_pad_to_target(image, target_size)` | Strict centered zero-pad of a 2D image to `target_size × target_size`; raises if input is larger. |
+
+### 4. Intensity & geometric transforms
+
+| Function | Purpose |
+|---|---|
 | `normalize_intensity(arr, normalization, scale=1.0)` | Scale `arr` by `scale / normalization`. Match the per-dataset normalization the ViT model was trained with. |
-| `apply_intensity_floor(arr, threshold)` | Zero values strictly below `threshold` (noise-floor cutoff). **Mutates in place** and returns `arr`. |
 | `fourier_shift(images, shifts)` | Sub-pixel shift each `(H, W)` plane by `shifts[i] = (dy, dx)` via FFT phase-ramp multiplication. |
 | `compute_sample_pixel_size(wavelength_m, detector_distance_m, ccd_pixel_size_m, n_pixels)` | Far-field pixel size at the sample plane: `λ z / (N · dx_detector)`. |
 

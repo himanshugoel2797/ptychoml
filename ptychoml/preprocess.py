@@ -5,6 +5,14 @@ caller — HXN HDF5 pipelines, holoptycho's streaming Holoscan operators,
 notebook one-offs — without dragging in HDF5, MPI, or filesystem
 dependencies.
 
+Functions are grouped into four sections so variants can be evaluated
+side-by-side:
+
+    1. ROI detection            — find a region without modifying the data
+    2. Crop / pad / resize      — change the spatial extent of the data
+    3. Bad-pixel & threshold    — mask, inpaint, or threshold-clip values
+    4. Intensity & geometry     — scale, shift, geometry helpers
+
 Provenance
 ----------
 Each function below has a ``Source:`` line in its docstring naming the
@@ -74,6 +82,165 @@ def _get_xp(arr):
     return np
 
 
+# ============================================================================
+# 1. ROI detection
+# ----------------------------------------------------------------------------
+# Find where the signal lives in a frame — these return coordinates and do
+# *not* modify the input. Two variants here:
+#   - auto_detect_roi_offsets: intensity-weighted COM with saturation masking
+#   - estimate_roi: normalized intensity projections + edge-of-signal threshold
+# Pair them with crop_to_roi to actually crop the data.
+# ============================================================================
+
+
+def auto_detect_roi_offsets(
+    frames: np.ndarray,
+    nx: int,
+    ny: int,
+    n_sample: int = 50,
+) -> Tuple[int, int]:
+    """Auto-detect detector ROI offsets from the diffraction-pattern center.
+
+    Averages up to ``n_sample`` frames, masks pixels saturated at the
+    dtype max (hot pixels / detector artifacts that drag the COM off
+    course), then computes the intensity-weighted center of mass and
+    returns ``(bx0, by0)`` such that an ``nx × ny`` crop is centered on
+    it. Returns ``(0, 0)`` if the masked frame has zero total intensity.
+
+    Source: holoptycho/scripts/replay_from_tiled.py ``_auto_batch_offsets``.
+    """
+    sample = frames[:min(n_sample, len(frames))].astype(np.float64)
+    mean_frame = sample.mean(axis=0)
+    sat_mask = (sample == np.iinfo(frames.dtype).max).any(axis=0)
+    masked = np.where(sat_mask, 0.0, mean_frame)
+    total = masked.sum()
+    if total <= 0:
+        return 0, 0
+    ys, xs = np.indices(masked.shape)
+    cy = float((ys * masked).sum() / total)
+    cx = float((xs * masked).sum() / total)
+    h, w = mean_frame.shape
+    bx0 = max(0, min(w - nx, round(cx - nx / 2)))
+    by0 = max(0, min(h - ny, round(cy - ny / 2)))
+    return int(bx0), int(by0)
+
+
+def _project_on_x(image: np.ndarray) -> np.ndarray:
+    """Sum along axis 0. Source: ptycho_gui/.../imgTools.py ``project_on_x``."""
+    return np.cumsum(image, axis=0)[-1]
+
+
+def _project_on_y(image: np.ndarray) -> np.ndarray:
+    """Sum along axis 1. Source: ptycho_gui/.../imgTools.py ``project_on_y``."""
+    return np.cumsum(image, axis=1)[:, -1]
+
+
+def _find_start_end(arr: np.ndarray, threshold_weight: float = 0.3) -> Tuple[int, int]:
+    """Edge-of-signal indices in a 1D projection.
+
+    Source: ptycho_gui/.../imgTools.py ``find_start_end``.
+    """
+    diff = np.abs(arr[:-1] - arr[1:])
+    diff = diff < threshold_weight * np.mean(diff)
+    start = np.argmin(diff) - 2
+    end = len(arr) - np.argmin(diff[::-1]) - 1 + 2
+    return start, end
+
+
+def estimate_roi(image: np.ndarray, threshold: float = 0.1) -> Tuple[int, int, int, int]:
+    """Estimate a rectangular ROI ``(x0, y0, w, h)`` via intensity projection.
+
+    Variant of :func:`auto_detect_roi_offsets` that normalises the image
+    to ``[0, 1]``, projects onto each axis, and uses an edge-of-signal
+    threshold to pick start/end positions. Falls back to the full image
+    if the detected box is degenerate.
+
+    Source: ptycho_gui/nsls2ptycho/core/widgets/imgTools.py ``estimate_roi``.
+    """
+    height, width = image.shape
+    _image = (image - np.min(image)) / np.ptp(image)
+
+    proj_x = _project_on_x(_image) / height
+    proj_y = _project_on_y(_image) / width
+
+    x0, x1 = _find_start_end(proj_x, threshold)
+    y0, y1 = _find_start_end(proj_y, threshold)
+
+    x0 = int(np.clip(x0, 0, width - 1))
+    x1 = int(np.clip(x1, 0, width - 1))
+    y0 = int(np.clip(y0, 0, height - 1))
+    y1 = int(np.clip(y1, 0, height - 1))
+
+    w = x1 - x0
+    h = y1 - y0
+
+    if w <= 0 or h <= 0:
+        x0 = 0
+        y0 = 0
+        w = width - 1
+        h = height - 1
+
+    return x0, y0, w, h
+
+
+# ============================================================================
+# 2. Crop / pad / resize
+# ----------------------------------------------------------------------------
+# Change the spatial extent of frames. Three variants by use case:
+#   - crop_to_roi:                 fixed window, identical for every frame
+#   - zero_pad_to_target:          strict centered pad; errors if input is too big
+#   - resize_diffraction_patterns: combined per-frame argmax-crop + zero-pad
+# ============================================================================
+
+
+def crop_to_roi(arr: np.ndarray, roi) -> np.ndarray:
+    """Crop the last two axes of ``arr`` to a fixed ``[[y0, y1], [x0, x1]]`` ROI.
+
+    Used when the crop window is known from detector calibration and should
+    be applied identically to every frame (e.g. holoptycho streaming). The
+    ROI uses Python half-open ranges: ``[y0, y1)`` rows, ``[x0, x1)`` cols.
+    Works on numpy or cupy arrays (slicing is method-based).
+
+    Source: holoptycho/preprocess.py ``ImageBatchOp.compute`` inline crop.
+    """
+    roi = np.asarray(roi)
+    y0, y1 = int(roi[0, 0]), int(roi[0, 1])
+    x0, x1 = int(roi[1, 0]), int(roi[1, 1])
+    return arr[..., y0:y1, x0:x1]
+
+
+def zero_pad_to_target(image: np.ndarray, target_size: int) -> np.ndarray:
+    """Zero-pad a 2D image to ``target_size × target_size``, keeping content centered.
+
+    Strict variant of :func:`resize_diffraction_patterns`'s pad branch:
+    raises ``ValueError`` if the input is larger than ``target_size`` on
+    either axis. Returns the input unchanged if already at target;
+    otherwise allocates and returns a new array.
+
+    Source: ptycho-vit ``data.py:_zero_pad_to_target``.
+    """
+    h, w = image.shape
+    if h == target_size and w == target_size:
+        return image
+    if h > target_size or w > target_size:
+        raise ValueError(
+            f"Image size ({h}, {w}) larger than target size ({target_size})"
+        )
+
+    pad_h = target_size - h
+    pad_w = target_size - w
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+    return np.pad(
+        image,
+        ((pad_top, pad_bottom), (pad_left, pad_right)),
+        mode="constant",
+        constant_values=0,
+    )
+
+
 def resize_diffraction_patterns(dp: ArrayLike, target_n: int) -> np.ndarray:
     """Crop or zero-pad each diffraction pattern to ``target_n × target_n``.
 
@@ -111,6 +278,23 @@ def resize_diffraction_patterns(dp: ArrayLike, target_n: int) -> np.ndarray:
     return np.array(resized)
 
 
+# ============================================================================
+# 3. Bad-pixel masking, inpainting & threshold cleanup
+# ----------------------------------------------------------------------------
+# Three sub-styles share this section:
+#   (a) Threshold-based masks (single-pass, value test):
+#         - mask_hot_pixels:        value > threshold → fill
+#         - apply_intensity_floor:  value < threshold → 0    (symmetric)
+#         - mask_saturated_pixels:  value == dtype max → fill
+#   (b) Median inpainting at known coords:
+#         - inpaint_bad_pixels:     coords as (K, 2); 3×3 (or larger) median
+#         - rm_outlier_pixels:      parallel rows/cols arrays + zero-fill option
+#   (c) Auto-detection (no caller-supplied coords):
+#         - find_outlier_pixels:    median-filter difference, σ-based threshold
+# All masking ops mutate in place (zero allocation, suitable for streaming).
+# ============================================================================
+
+
 def mask_hot_pixels(
     arr: np.ndarray,
     threshold: float,
@@ -129,6 +313,20 @@ def mask_hot_pixels(
     return arr
 
 
+def apply_intensity_floor(arr: np.ndarray, threshold: float) -> np.ndarray:
+    """Zero values strictly below ``threshold`` (noise-floor cutoff), in place.
+
+    Symmetric to ``mask_hot_pixels`` (which zeros values *above* a
+    threshold). Mutates ``arr`` and returns it (no allocation), so this
+    is safe to use in streaming hot paths. Works on numpy or cupy arrays.
+
+    Source: holoptycho/preprocess.py ``ImagePreprocessorOp.compute``
+    ``detmap_threshold`` block (also in eiger_test cupy variant).
+    """
+    arr[arr < threshold] = 0
+    return arr
+
+
 def mask_saturated_pixels(arr: np.ndarray, fill: float = 0.0) -> np.ndarray:
     """Replace dtype-max sentinel values with ``fill``, in place.
 
@@ -144,38 +342,6 @@ def mask_saturated_pixels(arr: np.ndarray, fill: float = 0.0) -> np.ndarray:
     sentinel = np.iinfo(arr.dtype).max
     arr[arr == sentinel] = fill
     return arr
-
-
-def compute_sample_pixel_size(
-    wavelength_m: float,
-    detector_distance_m: float,
-    ccd_pixel_size_m: float,
-    n_pixels: int,
-) -> float:
-    """Far-field (Fraunhofer) pixel size at the sample plane.
-
-    ``dx_sample = λ * z / (N * dx_detector)``
-
-    Source: extracted from inline formula reused 4× across HXN h5_conv
-    (provided via temp_code).
-    """
-    return wavelength_m * detector_distance_m / (n_pixels * ccd_pixel_size_m)
-
-
-def crop_to_roi(arr: np.ndarray, roi) -> np.ndarray:
-    """Crop the last two axes of ``arr`` to a fixed ``[[y0, y1], [x0, x1]]`` ROI.
-
-    Used when the crop window is known from detector calibration and should
-    be applied identically to every frame (e.g. holoptycho streaming). The
-    ROI uses Python half-open ranges: ``[y0, y1)`` rows, ``[x0, x1)`` cols.
-    Works on numpy or cupy arrays (slicing is method-based).
-
-    Source: holoptycho/preprocess.py ``ImageBatchOp.compute`` inline crop.
-    """
-    roi = np.asarray(roi)
-    y0, y1 = int(roi[0, 0]), int(roi[0, 1])
-    x0, x1 = int(roi[1, 0]), int(roi[1, 1])
-    return arr[..., y0:y1, x0:x1]
 
 
 def inpaint_bad_pixels(
@@ -209,81 +375,6 @@ def inpaint_bad_pixels(
         window = arr[..., r0:r1, c0:c1]
         arr[..., r, c] = xp.median(window, axis=(-2, -1))
     return arr
-
-
-def apply_intensity_floor(arr: np.ndarray, threshold: float) -> np.ndarray:
-    """Zero values strictly below ``threshold`` (noise-floor cutoff), in place.
-
-    Symmetric to ``mask_hot_pixels`` (which zeros values *above* a
-    threshold). Mutates ``arr`` and returns it (no allocation), so this
-    is safe to use in streaming hot paths. Works on numpy or cupy arrays.
-
-    Source: holoptycho/preprocess.py ``ImagePreprocessorOp.compute``
-    ``detmap_threshold`` block (also in eiger_test cupy variant).
-    """
-    arr[arr < threshold] = 0
-    return arr
-
-
-def fourier_shift(images: np.ndarray, shifts: np.ndarray) -> np.ndarray:
-    """Sub-pixel shift each ``(H, W)`` plane of ``images`` by ``shifts[i] = (dy, dx)``.
-
-    FFT-based phase-ramp multiplication. Runs in ``complex64`` via
-    ``scipy.fft`` with worker threads for speed; output is cast back to
-    the input dtype. Used by holoptycho's mosaic stitcher to place ViT
-    output patches at fractional positions.
-
-    Source: holoptycho/mosaic_stitch.py ``_fourier_shift``.
-    """
-    h, w = images.shape[-2:]
-    images_c = np.asarray(images, dtype=np.complex64)
-    ft = scipy.fft.fft2(images_c, workers=-1)
-
-    shifts_f32 = np.asarray(shifts, dtype=np.float32)
-    fy = np.fft.fftfreq(h).astype(np.float32)
-    fx = np.fft.fftfreq(w).astype(np.float32)
-    two_pi_neg = -2.0 * np.float32(np.pi)
-    arg_y = (two_pi_neg * shifts_f32[:, 0, None]) * fy[None, :]
-    arg_x = (two_pi_neg * shifts_f32[:, 1, None]) * fx[None, :]
-    ramp_y = np.exp((1j * arg_y).astype(np.complex64))
-    ramp_x = np.exp((1j * arg_x).astype(np.complex64))
-    ft *= ramp_y[:, :, None]
-    ft *= ramp_x[:, None, :]
-
-    out = scipy.fft.ifft2(ft, workers=-1)
-    return out.real.astype(images.dtype, copy=False)
-
-
-def auto_detect_roi_offsets(
-    frames: np.ndarray,
-    nx: int,
-    ny: int,
-    n_sample: int = 50,
-) -> Tuple[int, int]:
-    """Auto-detect detector ROI offsets from the diffraction-pattern center.
-
-    Averages up to ``n_sample`` frames, masks pixels saturated at the
-    dtype max (hot pixels / detector artifacts that drag the COM off
-    course), then computes the intensity-weighted center of mass and
-    returns ``(bx0, by0)`` such that an ``nx × ny`` crop is centered on
-    it. Returns ``(0, 0)`` if the masked frame has zero total intensity.
-
-    Source: holoptycho/scripts/replay_from_tiled.py ``_auto_batch_offsets``.
-    """
-    sample = frames[:min(n_sample, len(frames))].astype(np.float64)
-    mean_frame = sample.mean(axis=0)
-    sat_mask = (sample == np.iinfo(frames.dtype).max).any(axis=0)
-    masked = np.where(sat_mask, 0.0, mean_frame)
-    total = masked.sum()
-    if total <= 0:
-        return 0, 0
-    ys, xs = np.indices(masked.shape)
-    cy = float((ys * masked).sum() / total)
-    cx = float((xs * masked).sum() / total)
-    h, w = mean_frame.shape
-    bx0 = max(0, min(w - nx, round(cx - nx / 2)))
-    by0 = max(0, min(h - ny, round(cy - ny / 2)))
-    return int(bx0), int(by0)
 
 
 def rm_outlier_pixels(
@@ -387,94 +478,14 @@ def find_outlier_pixels(
     return hot_pixels
 
 
-def _project_on_x(image: np.ndarray) -> np.ndarray:
-    """Sum along axis 0. Source: ptycho_gui/.../imgTools.py ``project_on_x``."""
-    return np.cumsum(image, axis=0)[-1]
-
-
-def _project_on_y(image: np.ndarray) -> np.ndarray:
-    """Sum along axis 1. Source: ptycho_gui/.../imgTools.py ``project_on_y``."""
-    return np.cumsum(image, axis=1)[:, -1]
-
-
-def _find_start_end(arr: np.ndarray, threshold_weight: float = 0.3) -> Tuple[int, int]:
-    """Edge-of-signal indices in a 1D projection.
-
-    Source: ptycho_gui/.../imgTools.py ``find_start_end``.
-    """
-    diff = np.abs(arr[:-1] - arr[1:])
-    diff = diff < threshold_weight * np.mean(diff)
-    start = np.argmin(diff) - 2
-    end = len(arr) - np.argmin(diff[::-1]) - 1 + 2
-    return start, end
-
-
-def estimate_roi(image: np.ndarray, threshold: float = 0.1) -> Tuple[int, int, int, int]:
-    """Estimate a rectangular ROI ``(x0, y0, w, h)`` via intensity projection.
-
-    Variant of :func:`auto_detect_roi_offsets` that normalises the image
-    to ``[0, 1]``, projects onto each axis, and uses an edge-of-signal
-    threshold to pick start/end positions. Falls back to the full image
-    if the detected box is degenerate.
-
-    Source: ptycho_gui/nsls2ptycho/core/widgets/imgTools.py ``estimate_roi``.
-    """
-    height, width = image.shape
-    _image = (image - np.min(image)) / np.ptp(image)
-
-    proj_x = _project_on_x(_image) / height
-    proj_y = _project_on_y(_image) / width
-
-    x0, x1 = _find_start_end(proj_x, threshold)
-    y0, y1 = _find_start_end(proj_y, threshold)
-
-    x0 = int(np.clip(x0, 0, width - 1))
-    x1 = int(np.clip(x1, 0, width - 1))
-    y0 = int(np.clip(y0, 0, height - 1))
-    y1 = int(np.clip(y1, 0, height - 1))
-
-    w = x1 - x0
-    h = y1 - y0
-
-    if w <= 0 or h <= 0:
-        x0 = 0
-        y0 = 0
-        w = width - 1
-        h = height - 1
-
-    return x0, y0, w, h
-
-
-def zero_pad_to_target(image: np.ndarray, target_size: int) -> np.ndarray:
-    """Zero-pad a 2D image to ``target_size × target_size``, keeping content centered.
-
-    Strict variant of :func:`resize_diffraction_patterns`'s pad branch:
-    raises ``ValueError`` if the input is larger than ``target_size`` on
-    either axis. Returns the input unchanged if already at target;
-    otherwise allocates and returns a new array.
-
-    Source: ptycho-vit ``data.py:_zero_pad_to_target``.
-    """
-    h, w = image.shape
-    if h == target_size and w == target_size:
-        return image
-    if h > target_size or w > target_size:
-        raise ValueError(
-            f"Image size ({h}, {w}) larger than target size ({target_size})"
-        )
-
-    pad_h = target_size - h
-    pad_w = target_size - w
-    pad_top = pad_h // 2
-    pad_bottom = pad_h - pad_top
-    pad_left = pad_w // 2
-    pad_right = pad_w - pad_left
-    return np.pad(
-        image,
-        ((pad_top, pad_bottom), (pad_left, pad_right)),
-        mode="constant",
-        constant_values=0,
-    )
+# ============================================================================
+# 4. Intensity & geometric transforms
+# ----------------------------------------------------------------------------
+# Single-purpose helpers that don't fit the masking/cropping families:
+#   - normalize_intensity:       scalar rescale to match training-time normalization
+#   - fourier_shift:             FFT-based sub-pixel shift (mosaic stitching)
+#   - compute_sample_pixel_size: pure scalar geometry helper
+# ============================================================================
 
 
 def normalize_intensity(
@@ -491,3 +502,48 @@ def normalize_intensity(
     Source: ptycho-vit ``data.py:PtychographyDataset.normalize``.
     """
     return (arr / normalization) * scale
+
+
+def fourier_shift(images: np.ndarray, shifts: np.ndarray) -> np.ndarray:
+    """Sub-pixel shift each ``(H, W)`` plane of ``images`` by ``shifts[i] = (dy, dx)``.
+
+    FFT-based phase-ramp multiplication. Runs in ``complex64`` via
+    ``scipy.fft`` with worker threads for speed; output is cast back to
+    the input dtype. Used by holoptycho's mosaic stitcher to place ViT
+    output patches at fractional positions.
+
+    Source: holoptycho/mosaic_stitch.py ``_fourier_shift``.
+    """
+    h, w = images.shape[-2:]
+    images_c = np.asarray(images, dtype=np.complex64)
+    ft = scipy.fft.fft2(images_c, workers=-1)
+
+    shifts_f32 = np.asarray(shifts, dtype=np.float32)
+    fy = np.fft.fftfreq(h).astype(np.float32)
+    fx = np.fft.fftfreq(w).astype(np.float32)
+    two_pi_neg = -2.0 * np.float32(np.pi)
+    arg_y = (two_pi_neg * shifts_f32[:, 0, None]) * fy[None, :]
+    arg_x = (two_pi_neg * shifts_f32[:, 1, None]) * fx[None, :]
+    ramp_y = np.exp((1j * arg_y).astype(np.complex64))
+    ramp_x = np.exp((1j * arg_x).astype(np.complex64))
+    ft *= ramp_y[:, :, None]
+    ft *= ramp_x[:, None, :]
+
+    out = scipy.fft.ifft2(ft, workers=-1)
+    return out.real.astype(images.dtype, copy=False)
+
+
+def compute_sample_pixel_size(
+    wavelength_m: float,
+    detector_distance_m: float,
+    ccd_pixel_size_m: float,
+    n_pixels: int,
+) -> float:
+    """Far-field (Fraunhofer) pixel size at the sample plane.
+
+    ``dx_sample = λ * z / (N * dx_detector)``
+
+    Source: extracted from inline formula reused 4× across HXN h5_conv
+    (provided via temp_code).
+    """
+    return wavelength_m * detector_distance_m / (n_pixels * ccd_pixel_size_m)
