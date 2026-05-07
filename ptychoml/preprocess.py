@@ -8,11 +8,13 @@ dependencies.
 Provenance
 ----------
 Each function below has a ``Source:`` line in its docstring naming the
-upstream file/function it was lifted from. Two upstreams contribute:
+upstream file/function it was lifted from. Three upstreams contribute:
 
 * ``holoptycho`` — https://github.com/NSLS2/holoptycho (live streaming
   Holoscan pipeline). Inline array ops have been pulled out of Operator
   ``compute()`` methods into pure functions.
+* ``ptycho_gui`` — https://github.com/NSLS2/ptycho_gui (offline GUI for
+  iterative reconstruction). Source files cited as ``ptycho_gui/...``.
 * HXN h5_conv (offline HDF5-to-HDF5 converter, provided to this PR via a
   one-off ``temp_code`` script — not a public repo).
 
@@ -34,6 +36,7 @@ from typing import Iterable, Tuple, Union
 
 import numpy as np
 import scipy.fft
+from scipy.ndimage import median_filter
 
 ArrayLike = Union[np.ndarray, Iterable[np.ndarray]]
 
@@ -318,3 +321,200 @@ def auto_detect_roi_offsets(
     bx0 = max(0, min(w - nx, round(cx - nx / 2)))
     by0 = max(0, min(h - ny, round(cy - ny / 2)))
     return int(bx0), int(by0)
+
+
+def rm_outlier_pixels(
+    data: np.ndarray,
+    rows,
+    cols,
+    set_to_zero: bool = False,
+) -> np.ndarray:
+    """Replace outlier pixels at known ``(rows[i], cols[i])`` locations, in place.
+
+    Variant of :func:`inpaint_bad_pixels` that uses parallel ``rows`` and
+    ``cols`` arrays (rather than a ``(K, 2)`` coords array) and offers a
+    ``set_to_zero`` shortcut. Mutates ``data`` and returns it.
+
+    Note: faithfully copied from upstream — the median window is
+    ``data[x-1:x+1, y-1:y+1]`` (a 2×2 upper-left, *not* a 3×3 centered
+    window). This is a minor quirk of the upstream implementation.
+
+    Source: ptycho_gui/nsls2ptycho/core/widgets/imgTools.py ``rm_outlier_pixels``.
+    """
+    if set_to_zero:
+        data[rows, cols] = 0.0
+    else:
+        assert len(rows) == len(cols)
+        for x, y in zip(rows, cols):
+            data[x, y] = np.median(data[x - 1:x + 1, y - 1:y + 1])
+    return data
+
+
+def find_outlier_pixels(
+    data: np.ndarray,
+    tolerance: int = 3,
+    worry_about_edges: bool = True,
+    get_fixed_image: bool = False,
+):
+    """Detect hot/dead pixels in a 2D array via median-filter difference.
+
+    Returns ``hot_pixels`` (a ``(2, K)`` array of ``[rows, cols]``). When
+    ``get_fixed_image=True``, also returns a copy of ``data`` with the
+    detected pixels replaced by the median-filtered value, including
+    edge / corner cases when ``worry_about_edges=True``.
+
+    Note: faithfully copied — the ``tolerance`` parameter is currently
+    unused upstream (the threshold is hard-coded to ``10*std(diff)``).
+    Kept in the signature for compatibility.
+
+    Source: ptycho_gui/nsls2ptycho/core/widgets/imgTools.py ``find_outlier_pixels``.
+    """
+    data = data.astype(float)
+    blurred = median_filter(data, size=2)
+    difference = data - blurred
+    threshold = 10 * np.std(difference)
+
+    hot_pixels = np.nonzero(np.abs(difference[1:-1, 1:-1]) > threshold)
+    hot_pixels = np.array(hot_pixels) + 1
+
+    if get_fixed_image:
+        fixed_image = np.copy(data)
+        for y, x in zip(hot_pixels[0], hot_pixels[1]):
+            fixed_image[y, x] = blurred[y, x]
+
+        if worry_about_edges:
+            height, width = np.shape(data)
+
+            for index in range(1, height - 1):
+                med = np.median(data[index - 1:index + 2, 0:2])
+                if np.abs(data[index, 0] - med) > threshold:
+                    hot_pixels = np.hstack((hot_pixels, [[index], [0]]))
+                    fixed_image[index, 0] = med
+
+                med = np.median(data[index - 1:index + 2, -2:])
+                if np.abs(data[index, -1] - med) > threshold:
+                    hot_pixels = np.hstack((hot_pixels, [[index], [width - 1]]))
+                    fixed_image[index, -1] = med
+
+            for index in range(1, width - 1):
+                med = np.median(data[0:2, index - 1:index + 2])
+                if np.abs(data[0, index] - med) > threshold:
+                    hot_pixels = np.hstack((hot_pixels, [[0], [index]]))
+                    fixed_image[0, index] = med
+
+                med = np.median(data[-2:, index - 1:index + 2])
+                if np.abs(data[-1, index] - med) > threshold:
+                    hot_pixels = np.hstack((hot_pixels, [[height - 1], [index]]))
+                    fixed_image[-1, index] = med
+
+            for (cy, cx, py, px) in (
+                (0, 0, slice(0, 2), slice(0, 2)),
+                (0, -1, slice(0, 2), slice(-2, None)),
+                (-1, 0, slice(-2, None), slice(0, 2)),
+                (-1, -1, slice(-2, None), slice(-2, None)),
+            ):
+                med = np.median(data[py, px])
+                if np.abs(data[cy, cx] - med) > threshold:
+                    row = height - 1 if cy == -1 else 0
+                    col = width - 1 if cx == -1 else 0
+                    hot_pixels = np.hstack((hot_pixels, [[row], [col]]))
+                    fixed_image[cy, cx] = med
+
+        return hot_pixels, fixed_image
+    return hot_pixels
+
+
+def array_ensure_positive_elements(arr: np.ndarray) -> None:
+    """Replace zero / negative values in a 1D array with the closest *following* positive value.
+
+    Iterates the array in reverse so a non-positive entry is filled with
+    the next valid value to its right (more likely to belong to the same
+    sub-scan than the preceding one). Mutates ``arr`` in place; returns
+    ``None``. If the array contains no positive values, it is left
+    unchanged — callers should validate ``np.any(arr > 0)`` themselves
+    when that matters.
+
+    Source: ptycho_gui/nsls2ptycho/core/HXN_databroker.py
+    ``array_ensure_positive_elements`` (upstream ``name`` parameter and
+    diagnostic prints dropped — library code should be quiet).
+    """
+    n_items_to_replace = int(np.sum(arr <= 0))
+    if not n_items_to_replace:
+        return
+
+    v_closest_positive = None
+    for v in np.flip(arr):
+        if v > 0:
+            v_closest_positive = v
+            break
+
+    if v_closest_positive is None:
+        return
+
+    n_replaced = 0
+    for n in reversed(range(arr.size)):
+        if arr[n] <= 0:
+            arr[n] = v_closest_positive
+            n_replaced += 1
+            if n_replaced == n_items_to_replace:
+                break
+        else:
+            v_closest_positive = arr[n]
+
+
+def _project_on_x(image: np.ndarray) -> np.ndarray:
+    """Sum along axis 0. Source: ptycho_gui/.../imgTools.py ``project_on_x``."""
+    return np.cumsum(image, axis=0)[-1]
+
+
+def _project_on_y(image: np.ndarray) -> np.ndarray:
+    """Sum along axis 1. Source: ptycho_gui/.../imgTools.py ``project_on_y``."""
+    return np.cumsum(image, axis=1)[:, -1]
+
+
+def _find_start_end(arr: np.ndarray, threshold_weight: float = 0.3) -> Tuple[int, int]:
+    """Edge-of-signal indices in a 1D projection.
+
+    Source: ptycho_gui/.../imgTools.py ``find_start_end``.
+    """
+    diff = np.abs(arr[:-1] - arr[1:])
+    diff = diff < threshold_weight * np.mean(diff)
+    start = np.argmin(diff) - 2
+    end = len(arr) - np.argmin(diff[::-1]) - 1 + 2
+    return start, end
+
+
+def estimate_roi(image: np.ndarray, threshold: float = 0.1) -> Tuple[int, int, int, int]:
+    """Estimate a rectangular ROI ``(x0, y0, w, h)`` via intensity projection.
+
+    Variant of :func:`auto_detect_roi_offsets` that normalises the image
+    to ``[0, 1]``, projects onto each axis, and uses an edge-of-signal
+    threshold to pick start/end positions. Falls back to the full image
+    if the detected box is degenerate.
+
+    Source: ptycho_gui/nsls2ptycho/core/widgets/imgTools.py ``estimate_roi``.
+    """
+    height, width = image.shape
+    _image = (image - np.min(image)) / np.ptp(image)
+
+    proj_x = _project_on_x(_image) / height
+    proj_y = _project_on_y(_image) / width
+
+    x0, x1 = _find_start_end(proj_x, threshold)
+    y0, y1 = _find_start_end(proj_y, threshold)
+
+    x0 = int(np.clip(x0, 0, width - 1))
+    x1 = int(np.clip(x1, 0, width - 1))
+    y0 = int(np.clip(y0, 0, height - 1))
+    y1 = int(np.clip(y1, 0, height - 1))
+
+    w = x1 - x0
+    h = y1 - y0
+
+    if w <= 0 or h <= 0:
+        x0 = 0
+        y0 = 0
+        w = width - 1
+        h = height - 1
+
+    return x0, y0, w, h

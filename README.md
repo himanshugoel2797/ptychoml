@@ -91,14 +91,18 @@ from ptychoml import (
     adjust_object_for_pad,
     apply_angle_correction_x,
     apply_intensity_floor,
+    array_ensure_positive_elements,
     auto_detect_roi_offsets,
     compute_object_shape_from_scan,
     compute_sample_pixel_size,
     crop_to_roi,
+    estimate_roi,
+    find_outlier_pixels,
     fourier_shift,
     inpaint_bad_pixels,
     mask_hot_pixels,
     resize_diffraction_patterns,
+    rm_outlier_pixels,
 )
 ```
 
@@ -115,6 +119,10 @@ follow-up once call sites are unified.
 | `adjust_object_for_pad(obj, scale_y, scale_x, obj_pad)` | Trim or zero-pad an object's last two axes by `obj_pad * (scale - 1)` after a pixel-grid rescale, to match a backend's fixed padding allocation. |
 | `mask_hot_pixels(arr, threshold, fill=0.0)` | Replace values above `threshold` with `fill` (saturated/dead-pixel masking). **Mutates in place** and returns `arr`. |
 | `inpaint_bad_pixels(arr, coords, radius=1)` | Replace each `(row, col)` in `coords` with the median of a `(2*radius+1)²` neighborhood. Operates on the last two axes. **Mutates in place** and returns `arr`. |
+| `rm_outlier_pixels(data, rows, cols, set_to_zero=False)` | Variant of `inpaint_bad_pixels` taking parallel `rows`/`cols` arrays and a `set_to_zero` flag. **Mutates in place.** |
+| `find_outlier_pixels(data, tolerance=3, worry_about_edges=True, get_fixed_image=False)` | Auto-detect hot/dead pixels via median-filter difference (`> 10·σ`). Returns coords; optionally also returns a fixed copy. |
+| `array_ensure_positive_elements(arr)` | Replace zero/negative entries in a 1D array with the closest *following* positive value (reverse iteration). **Mutates in place.** |
+| `estimate_roi(image, threshold=0.1)` | Variant of `auto_detect_roi_offsets` using normalized intensity projections and edge-of-signal detection. Returns `(x0, y0, w, h)`. |
 | `apply_intensity_floor(arr, threshold)` | Zero values strictly below `threshold` (noise-floor cutoff). **Mutates in place** and returns `arr`. |
 | `fourier_shift(images, shifts)` | Sub-pixel shift each `(H, W)` plane by `shifts[i] = (dy, dx)` via FFT phase-ramp multiplication. |
 | `apply_angle_correction_x(value, angle_deg)` | Rescale an x-axis quantity by `|cos(angle)|` (when `|angle| ≤ 45°`) or `|sin(angle)|` otherwise. |

@@ -6,14 +6,18 @@ from ptychoml.preprocess import (
     adjust_object_for_pad,
     apply_angle_correction_x,
     apply_intensity_floor,
+    array_ensure_positive_elements,
     auto_detect_roi_offsets,
     compute_object_shape_from_scan,
     compute_sample_pixel_size,
     crop_to_roi,
+    estimate_roi,
+    find_outlier_pixels,
     fourier_shift,
     inpaint_bad_pixels,
     mask_hot_pixels,
     resize_diffraction_patterns,
+    rm_outlier_pixels,
 )
 
 
@@ -304,6 +308,81 @@ def test_auto_detect_roi_offsets_handles_saturation():
 def test_auto_detect_roi_offsets_zero_frames_returns_origin():
     frames = np.zeros((5, 32, 32), dtype=np.uint16)
     assert auto_detect_roi_offsets(frames, nx=16, ny=16) == (0, 0)
+
+
+# ----- rm_outlier_pixels ----------------------------------------------------
+
+def test_rm_outlier_pixels_set_to_zero():
+    arr = np.array([[1.0, 2.0, 3.0], [4.0, 999.0, 6.0], [7.0, 8.0, 9.0]], dtype=np.float32)
+    out = rm_outlier_pixels(arr, rows=[1], cols=[1], set_to_zero=True)
+    assert out is arr  # in-place
+    assert arr[1, 1] == 0.0
+
+
+def test_rm_outlier_pixels_median_replace():
+    arr = np.full((5, 5), 10.0, dtype=np.float32)
+    arr[2, 2] = 999.0
+    out = rm_outlier_pixels(arr, rows=[2], cols=[2])
+    assert out is arr
+    # Upstream uses [x-1:x+1, y-1:y+1] (a 2x2 window of 10s) → median 10.
+    assert arr[2, 2] == 10.0
+
+
+# ----- find_outlier_pixels --------------------------------------------------
+
+def test_find_outlier_pixels_detects_injected_hot_pixel():
+    rng = np.random.default_rng(42)
+    img = rng.normal(loc=100.0, scale=1.0, size=(20, 20))
+    img[8, 12] = 5000.0  # injected hot pixel
+    coords = find_outlier_pixels(img, get_fixed_image=False)
+    # coords is shape (2, K); should contain (8, 12).
+    found = list(zip(coords[0], coords[1]))
+    assert (8, 12) in found
+
+
+def test_find_outlier_pixels_returns_fixed_image():
+    rng = np.random.default_rng(0)
+    img = rng.normal(loc=100.0, scale=1.0, size=(15, 15))
+    img[7, 7] = 5000.0
+    _, fixed = find_outlier_pixels(img, get_fixed_image=True, worry_about_edges=False)
+    # The hot pixel should be replaced with something near the local mean.
+    assert abs(fixed[7, 7] - 100.0) < 10.0
+
+
+# ----- array_ensure_positive_elements ---------------------------------------
+
+def test_array_ensure_positive_elements_replaces_zeros():
+    arr = np.array([1.0, 0.0, 3.0, 0.0, 5.0], dtype=np.float64)
+    array_ensure_positive_elements(arr)
+    # Reverse-iteration: zero at idx 3 → 5; zero at idx 1 → 3.
+    np.testing.assert_array_equal(arr, np.array([1.0, 3.0, 3.0, 5.0, 5.0]))
+
+
+def test_array_ensure_positive_elements_no_op_for_all_positive():
+    arr = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+    original = arr.copy()
+    array_ensure_positive_elements(arr)
+    np.testing.assert_array_equal(arr, original)
+
+
+def test_array_ensure_positive_elements_all_non_positive_is_noop():
+    arr = np.array([-1.0, -2.0, 0.0], dtype=np.float64)
+    original = arr.copy()
+    array_ensure_positive_elements(arr)
+    np.testing.assert_array_equal(arr, original)
+
+
+# ----- estimate_roi ---------------------------------------------------------
+
+def test_estimate_roi_finds_central_block():
+    """A bright square in a dark image — ROI should be a valid non-empty box."""
+    img = np.zeros((100, 100), dtype=np.float32)
+    img[30:70, 40:80] = 1.0
+    x0, y0, w, h = estimate_roi(img, threshold=0.1)
+    assert 0 <= x0 < 100
+    assert 0 <= y0 < 100
+    assert w > 0
+    assert h > 0
 
 
 # ----- compute_sample_pixel_size --------------------------------------------
