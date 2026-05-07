@@ -109,11 +109,11 @@ def test_mask_hot_pixels_above_threshold_replaced():
     )
 
 
-def test_mask_hot_pixels_does_not_mutate_input():
+def test_mask_hot_pixels_mutates_in_place():
     arr = np.array([60001.0, 1.0], dtype=np.float32)
-    original = arr.copy()
-    _ = mask_hot_pixels(arr, threshold=60000.0)
-    np.testing.assert_array_equal(arr, original)
+    out = mask_hot_pixels(arr, threshold=60000.0)
+    assert out is arr  # same object — no allocation
+    np.testing.assert_array_equal(arr, np.array([0.0, 1.0], dtype=np.float32))
 
 
 def test_mask_hot_pixels_custom_fill():
@@ -168,11 +168,12 @@ def test_inpaint_bad_pixels_3d_stack():
         assert out[i, 2, 2] == float(i + 1)
 
 
-def test_inpaint_bad_pixels_does_not_mutate_input():
-    arr = np.array([[1.0, 2.0], [3.0, 999.0]], dtype=np.float32)
-    original = arr.copy()
-    _ = inpaint_bad_pixels(arr, coords=[(1, 1)])
-    np.testing.assert_array_equal(arr, original)
+def test_inpaint_bad_pixels_mutates_in_place():
+    arr = np.full((5, 5), 10.0, dtype=np.float32)
+    arr[2, 2] = 999.0
+    out = inpaint_bad_pixels(arr, coords=[(2, 2)])
+    assert out is arr  # same object — no allocation
+    assert arr[2, 2] == 10.0
 
 
 # ----- apply_intensity_floor ------------------------------------------------
@@ -185,11 +186,11 @@ def test_apply_intensity_floor_below_threshold_zeroed():
     )
 
 
-def test_apply_intensity_floor_does_not_mutate_input():
+def test_apply_intensity_floor_mutates_in_place():
     arr = np.array([0.1, 5.0], dtype=np.float32)
-    original = arr.copy()
-    _ = apply_intensity_floor(arr, threshold=1.0)
-    np.testing.assert_array_equal(arr, original)
+    out = apply_intensity_floor(arr, threshold=1.0)
+    assert out is arr  # same object — no allocation
+    np.testing.assert_array_equal(arr, np.array([0.0, 5.0], dtype=np.float32))
 
 
 # ----- fourier_shift --------------------------------------------------------

@@ -113,9 +113,9 @@ follow-up once call sites are unified.
 | `resize_diffraction_patterns(dp, target_n)` | Crop each pattern around its per-frame argmax or zero-pad to `target_n × target_n`. Mask hot pixels first if the detector has saturated outliers. |
 | `auto_detect_roi_offsets(frames, nx, ny)` | Center an `nx × ny` crop on the diffraction-pattern center of mass after masking saturated pixels. |
 | `adjust_object_for_pad(obj, scale_y, scale_x, obj_pad)` | Trim or zero-pad an object's last two axes by `obj_pad * (scale - 1)` after a pixel-grid rescale, to match a backend's fixed padding allocation. |
-| `mask_hot_pixels(arr, threshold, fill=0.0)` | Replace values above `threshold` with `fill` (saturated/dead-pixel masking). Returns a copy. |
-| `inpaint_bad_pixels(arr, coords, radius=1)` | Replace each `(row, col)` in `coords` with the median of a `(2*radius+1)²` neighborhood. Operates on the last two axes. Returns a copy. |
-| `apply_intensity_floor(arr, threshold)` | Zero values strictly below `threshold` (noise-floor cutoff). Returns a copy. |
+| `mask_hot_pixels(arr, threshold, fill=0.0)` | Replace values above `threshold` with `fill` (saturated/dead-pixel masking). **Mutates in place** and returns `arr`. |
+| `inpaint_bad_pixels(arr, coords, radius=1)` | Replace each `(row, col)` in `coords` with the median of a `(2*radius+1)²` neighborhood. Operates on the last two axes. **Mutates in place** and returns `arr`. |
+| `apply_intensity_floor(arr, threshold)` | Zero values strictly below `threshold` (noise-floor cutoff). **Mutates in place** and returns `arr`. |
 | `fourier_shift(images, shifts)` | Sub-pixel shift each `(H, W)` plane by `shifts[i] = (dy, dx)` via FFT phase-ramp multiplication. |
 | `apply_angle_correction_x(value, angle_deg)` | Rescale an x-axis quantity by `|cos(angle)|` (when `|angle| ≤ 45°`) or `|sin(angle)|` otherwise. |
 | `compute_object_shape_from_scan(x_range_um, y_range_um, nx_prb, ny_prb, x_pixel_m, y_pixel_m, obj_pad)` | Object array shape needed to cover a scan region; rounds each axis up to even for FFT-friendly sizes. |

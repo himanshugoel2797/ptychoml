@@ -123,16 +123,17 @@ def mask_hot_pixels(
     threshold: float,
     fill: float = 0.0,
 ) -> np.ndarray:
-    """Replace values strictly greater than ``threshold`` with ``fill``.
+    """Replace values strictly greater than ``threshold`` with ``fill``, in place.
 
-    Returns a copy; the input array is not modified.
+    Mutates ``arr`` and returns it (no allocation), so this is safe to use
+    in streaming hot paths. Callers wanting a copy should pass
+    ``arr.copy()`` explicitly.
 
     Source: HXN h5_conv ``load_ptycho_data`` inline ``raw_counts > 60000``
     handler (provided via temp_code).
     """
-    out = arr.copy()
-    out[out > threshold] = fill
-    return out
+    arr[arr > threshold] = fill
+    return arr
 
 
 def compute_sample_pixel_size(
@@ -171,18 +172,20 @@ def inpaint_bad_pixels(
     coords,
     radius: int = 1,
 ) -> np.ndarray:
-    """Replace known bad-pixel coordinates with the median of their neighbourhood.
+    """Replace known bad-pixel coordinates with the median of their neighbourhood, in place.
 
     For each ``(row, col)`` in ``coords``, replaces the pixel at that
     location with the median of the surrounding ``(2*radius+1) × (2*radius+1)``
     window. Operates on the last two axes; works for both 2D arrays and
-    stacks of shape ``(N, H, W)``. Returns a copy.
+    stacks of shape ``(N, H, W)``. Mutates ``arr`` and returns it. The
+    loop is sequential, so a later coord's median is computed against any
+    earlier replacement that overlaps its window — matching upstream
+    behavior.
 
     Source: holoptycho/preprocess.py ``ImagePreprocessorOp.compute`` inline
     bad-pixel inpainting loop.
     """
-    out = arr.copy()
-    h, w = out.shape[-2], out.shape[-1]
+    h, w = arr.shape[-2], arr.shape[-1]
     coords = np.asarray(coords).reshape(-1, 2)
     for r, c in coords:
         r, c = int(r), int(c)
@@ -190,23 +193,23 @@ def inpaint_bad_pixels(
         r1 = min(r + radius + 1, h)
         c0 = max(c - radius, 0)
         c1 = min(c + radius + 1, w)
-        window = out[..., r0:r1, c0:c1]
-        out[..., r, c] = np.median(window, axis=(-2, -1))
-    return out
+        window = arr[..., r0:r1, c0:c1]
+        arr[..., r, c] = np.median(window, axis=(-2, -1))
+    return arr
 
 
 def apply_intensity_floor(arr: np.ndarray, threshold: float) -> np.ndarray:
-    """Zero values strictly below ``threshold`` (noise-floor cutoff).
+    """Zero values strictly below ``threshold`` (noise-floor cutoff), in place.
 
-    Returns a copy; the input array is not modified. Symmetric to
-    ``mask_hot_pixels`` (which zeros values *above* a threshold).
+    Symmetric to ``mask_hot_pixels`` (which zeros values *above* a
+    threshold). Mutates ``arr`` and returns it (no allocation), so this
+    is safe to use in streaming hot paths.
 
     Source: holoptycho/preprocess.py ``ImagePreprocessorOp.compute``
     ``detmap_threshold`` block.
     """
-    out = arr.copy()
-    out[out < threshold] = 0
-    return out
+    arr[arr < threshold] = 0
+    return arr
 
 
 def fourier_shift(images: np.ndarray, shifts: np.ndarray) -> np.ndarray:
