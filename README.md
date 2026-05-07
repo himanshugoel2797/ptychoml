@@ -105,9 +105,15 @@ from ptychoml import (
 ```
 
 Each function's docstring includes a `Source:` line naming the upstream
-file/function it was lifted from (holoptycho or HXN h5_conv). Some
-functions are kept as side-by-side variants; they will be deduped in a
-follow-up once call sites are unified.
+file/function it was lifted from (holoptycho, ptycho_gui, ptycho-vit,
+or HXN h5_conv). Some functions are kept as side-by-side variants; they
+will be deduped in a follow-up once call sites are unified.
+
+**GPU support:** the in-place mutating functions (`mask_hot_pixels`,
+`apply_intensity_floor`, `mask_saturated_pixels`), `crop_to_roi`,
+`normalize_intensity`, and `inpaint_bad_pixels` work transparently on
+`cupy` arrays. Functions that use `scipy.fft` / `scipy.ndimage`
+(`fourier_shift`, `find_outlier_pixels`) remain numpy-only for now.
 
 | Function | Purpose |
 |---|---|
@@ -115,6 +121,7 @@ follow-up once call sites are unified.
 | `resize_diffraction_patterns(dp, target_n)` | Crop each pattern around its per-frame argmax or zero-pad to `target_n × target_n`. Mask hot pixels first if the detector has saturated outliers. |
 | `auto_detect_roi_offsets(frames, nx, ny)` | Center an `nx × ny` crop on the diffraction-pattern center of mass after masking saturated pixels. |
 | `mask_hot_pixels(arr, threshold, fill=0.0)` | Replace values above `threshold` with `fill` (saturated/dead-pixel masking). **Mutates in place** and returns `arr`. |
+| `mask_saturated_pixels(arr, fill=0.0)` | Replace dtype-max sentinel values (e.g. `65535` for `uint16`) with `fill`. **Mutates in place.** |
 | `inpaint_bad_pixels(arr, coords, radius=1)` | Replace each `(row, col)` in `coords` with the median of a `(2*radius+1)²` neighborhood. Operates on the last two axes. **Mutates in place** and returns `arr`. |
 | `rm_outlier_pixels(data, rows, cols, set_to_zero=False)` | Variant of `inpaint_bad_pixels` taking parallel `rows`/`cols` arrays and a `set_to_zero` flag. **Mutates in place.** |
 | `find_outlier_pixels(data, tolerance=3, worry_about_edges=True, get_fixed_image=False)` | Auto-detect hot/dead pixels via median-filter difference (`> 10·σ`). Returns coords; optionally also returns a fixed copy. |

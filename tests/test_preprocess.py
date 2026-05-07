@@ -12,6 +12,7 @@ from ptychoml.preprocess import (
     fourier_shift,
     inpaint_bad_pixels,
     mask_hot_pixels,
+    mask_saturated_pixels,
     normalize_intensity,
     resize_diffraction_patterns,
     rm_outlier_pixels,
@@ -91,6 +92,68 @@ def test_mask_hot_pixels_custom_fill():
     arr = np.array([1.0, 2.0, 3.0], dtype=np.float32)
     out = mask_hot_pixels(arr, threshold=1.5, fill=-1.0)
     np.testing.assert_array_equal(out, np.array([1.0, -1.0, -1.0], dtype=np.float32))
+
+
+# ----- mask_saturated_pixels ------------------------------------------------
+
+def test_mask_saturated_pixels_replaces_dtype_max():
+    arr = np.array([0, 100, 65535, 200], dtype=np.uint16)
+    out = mask_saturated_pixels(arr)
+    assert out is arr
+    np.testing.assert_array_equal(arr, np.array([0, 100, 0, 200], dtype=np.uint16))
+
+
+def test_mask_saturated_pixels_uint32():
+    arr = np.array([0, 4294967295, 5], dtype=np.uint32)
+    out = mask_saturated_pixels(arr, fill=0)
+    np.testing.assert_array_equal(arr, np.array([0, 0, 5], dtype=np.uint32))
+
+
+# ----- cupy compatibility (gated) -------------------------------------------
+
+def test_mask_hot_pixels_works_on_cupy():
+    cp = pytest.importorskip("cupy")
+    arr = cp.asarray(np.array([60001.0, 1.0], dtype=np.float32))
+    out = mask_hot_pixels(arr, threshold=60000.0)
+    assert out is arr
+    np.testing.assert_array_equal(cp.asnumpy(arr), np.array([0.0, 1.0], dtype=np.float32))
+
+
+def test_apply_intensity_floor_works_on_cupy():
+    cp = pytest.importorskip("cupy")
+    arr = cp.asarray(np.array([0.1, 5.0], dtype=np.float32))
+    out = apply_intensity_floor(arr, threshold=1.0)
+    assert out is arr
+    np.testing.assert_array_equal(cp.asnumpy(arr), np.array([0.0, 5.0], dtype=np.float32))
+
+
+def test_inpaint_bad_pixels_works_on_cupy():
+    cp = pytest.importorskip("cupy")
+    arr_cpu = np.full((5, 5), 10.0, dtype=np.float32)
+    arr_cpu[2, 2] = 999.0
+    arr = cp.asarray(arr_cpu)
+    out = inpaint_bad_pixels(arr, coords=[(2, 2)])
+    assert out is arr
+    assert float(arr[2, 2]) == 10.0
+
+
+def test_crop_to_roi_works_on_cupy():
+    cp = pytest.importorskip("cupy")
+    arr = cp.asarray(np.arange(20 * 30, dtype=np.float32).reshape(20, 30))
+    out = crop_to_roi(arr, [[5, 15], [10, 25]])
+    assert out.shape == (10, 15)
+    # Output should still be a cupy array.
+    assert isinstance(out, cp.ndarray)
+
+
+def test_mask_saturated_pixels_works_on_cupy():
+    cp = pytest.importorskip("cupy")
+    arr = cp.asarray(np.array([0, 100, 65535, 200], dtype=np.uint16))
+    out = mask_saturated_pixels(arr)
+    assert out is arr
+    np.testing.assert_array_equal(
+        cp.asnumpy(arr), np.array([0, 100, 0, 200], dtype=np.uint16)
+    )
 
 
 # ----- compute_sample_pixel_size --------------------------------------------

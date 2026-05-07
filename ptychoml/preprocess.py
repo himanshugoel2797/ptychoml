@@ -28,6 +28,18 @@ takes parallel ``rows``/``cols`` arrays while ``inpaint_bad_pixels`` takes
 side for now and will be deduped in a follow-up once call sites are
 unified.
 
+GPU support
+-----------
+Functions that only use array methods + slicing + comparisons (the
+in-place mutating ones, ``crop_to_roi``, ``normalize_intensity``) work
+transparently on ``cupy`` arrays because cupy is API-compatible with
+numpy at the method level. ``inpaint_bad_pixels`` and
+``mask_saturated_pixels`` use the small ``_get_xp`` helper to dispatch
+``median`` / ``iinfo`` against the right module. Functions that use
+``scipy.fft`` or ``scipy.ndimage`` (``fourier_shift``,
+``find_outlier_pixels``) remain numpy-only for now — cupy callers can
+move data to host or use the cupy-native equivalents directly.
+
 Per-frame argmax centering note
 -------------------------------
 ``resize_diffraction_patterns`` finds the crop center independently for
@@ -44,6 +56,22 @@ import scipy.fft
 from scipy.ndimage import median_filter
 
 ArrayLike = Union[np.ndarray, Iterable[np.ndarray]]
+
+
+def _get_xp(arr):
+    """Return the array's module (numpy or cupy).
+
+    Falls back to numpy when cupy is not installed. Used by functions
+    that need module-level calls (e.g. ``xp.median``) so they work on
+    both numpy and cupy arrays without duplicating the implementation.
+    """
+    try:
+        import cupy as cp
+        if isinstance(arr, cp.ndarray):
+            return cp
+    except ImportError:
+        pass
+    return np
 
 
 def resize_diffraction_patterns(dp: ArrayLike, target_n: int) -> np.ndarray:
@@ -92,12 +120,29 @@ def mask_hot_pixels(
 
     Mutates ``arr`` and returns it (no allocation), so this is safe to use
     in streaming hot paths. Callers wanting a copy should pass
-    ``arr.copy()`` explicitly.
+    ``arr.copy()`` explicitly. Works transparently on numpy or cupy arrays.
 
     Source: HXN h5_conv ``load_ptycho_data`` inline ``raw_counts > 60000``
     handler (provided via temp_code).
     """
     arr[arr > threshold] = fill
+    return arr
+
+
+def mask_saturated_pixels(arr: np.ndarray, fill: float = 0.0) -> np.ndarray:
+    """Replace dtype-max sentinel values with ``fill``, in place.
+
+    Many detectors signal a bad pixel by writing the max representable
+    value of the unsigned-integer dtype (e.g. ``65535`` for ``uint16``,
+    interpreted as ``-1``). This zeroes them out without needing the
+    caller to remember the dtype's max. Works on numpy or cupy arrays.
+
+    Source: holoptycho/preprocess.py ``ImageBatchOp.compute`` and
+    eiger_test/pipeline_preprocess.py inline
+    ``image[image == np.iinfo(image.dtype).max] = 0``.
+    """
+    sentinel = np.iinfo(arr.dtype).max
+    arr[arr == sentinel] = fill
     return arr
 
 
@@ -123,6 +168,7 @@ def crop_to_roi(arr: np.ndarray, roi) -> np.ndarray:
     Used when the crop window is known from detector calibration and should
     be applied identically to every frame (e.g. holoptycho streaming). The
     ROI uses Python half-open ranges: ``[y0, y1)`` rows, ``[x0, x1)`` cols.
+    Works on numpy or cupy arrays (slicing is method-based).
 
     Source: holoptycho/preprocess.py ``ImageBatchOp.compute`` inline crop.
     """
@@ -145,11 +191,13 @@ def inpaint_bad_pixels(
     stacks of shape ``(N, H, W)``. Mutates ``arr`` and returns it. The
     loop is sequential, so a later coord's median is computed against any
     earlier replacement that overlaps its window — matching upstream
-    behavior.
+    behavior. Works on numpy or cupy arrays (median is dispatched against
+    the array's module).
 
     Source: holoptycho/preprocess.py ``ImagePreprocessorOp.compute`` inline
-    bad-pixel inpainting loop.
+    bad-pixel inpainting loop (also in eiger_test cupy variant).
     """
+    xp = _get_xp(arr)
     h, w = arr.shape[-2], arr.shape[-1]
     coords = np.asarray(coords).reshape(-1, 2)
     for r, c in coords:
@@ -159,7 +207,7 @@ def inpaint_bad_pixels(
         c0 = max(c - radius, 0)
         c1 = min(c + radius + 1, w)
         window = arr[..., r0:r1, c0:c1]
-        arr[..., r, c] = np.median(window, axis=(-2, -1))
+        arr[..., r, c] = xp.median(window, axis=(-2, -1))
     return arr
 
 
@@ -168,10 +216,10 @@ def apply_intensity_floor(arr: np.ndarray, threshold: float) -> np.ndarray:
 
     Symmetric to ``mask_hot_pixels`` (which zeros values *above* a
     threshold). Mutates ``arr`` and returns it (no allocation), so this
-    is safe to use in streaming hot paths.
+    is safe to use in streaming hot paths. Works on numpy or cupy arrays.
 
     Source: holoptycho/preprocess.py ``ImagePreprocessorOp.compute``
-    ``detmap_threshold`` block.
+    ``detmap_threshold`` block (also in eiger_test cupy variant).
     """
     arr[arr < threshold] = 0
     return arr
