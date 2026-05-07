@@ -82,6 +82,112 @@ Additional options:
 
 The output HDF5 file contains a `predictions` dataset with shape `(N, 2, H, W)` or `(N, H, W)` depending on the model. If the input file has a `points` dataset (scan positions), it is copied through to the output.
 
+## Preprocessing utilities
+
+Array-in / array-out helpers for preparing diffraction data and reconstructions before inference. Importable from the top-level package:
+
+```python
+from ptychoml import (
+    apply_intensity_floor,
+    auto_detect_roi_offsets,
+    compute_sample_pixel_size,
+    crop_to_roi,
+    estimate_roi,
+    find_outlier_pixels,
+    fourier_shift,
+    inpaint_bad_pixels,
+    mask_hot_pixels,
+    normalize_intensity,
+    resize_diffraction_patterns,
+    zero_pad_to_target,
+)
+```
+
+Each function's docstring includes a `Source:` line naming the upstream
+file/function it was lifted from (holoptycho, ptycho_gui, ptycho-vit,
+or HXN h5_conv). Some functions are kept as side-by-side variants; they
+will be deduped in a follow-up once call sites are unified.
+
+**GPU support:** the in-place mutating functions (`mask_hot_pixels`,
+`apply_intensity_floor`), `crop_to_roi`, `normalize_intensity`, and
+`inpaint_bad_pixels` work transparently on `cupy` arrays. Functions
+that use `scipy.fft` / `scipy.ndimage` (`fourier_shift`,
+`find_outlier_pixels`) remain numpy-only for now.
+
+Functions are grouped into four families so variants can be evaluated
+side-by-side. The same grouping is used in
+[`ptychoml/preprocess.py`](ptychoml/preprocess.py).
+
+### 1. ROI detection
+
+Find where the signal lives in a frame; these return coordinates and do
+not modify the input. Pair them with `crop_to_roi` to actually crop.
+
+| Function | Purpose |
+|---|---|
+| `auto_detect_roi_offsets(frames, nx, ny)` | Center an `nx × ny` crop on the diffraction-pattern center of mass after masking saturated pixels. Returns `(bx0, by0)`. |
+| `estimate_roi(image, threshold=0.1)` | Variant using normalized intensity projections and edge-of-signal detection instead of COM. Returns `(x0, y0, w, h)`. |
+
+### 2. Crop / pad / resize
+
+Change the spatial extent of frames. Three variants by use case.
+
+| Function | Purpose |
+|---|---|
+| `crop_to_roi(arr, roi)` | Crop the last two axes to a fixed `[[y0, y1], [x0, x1]]` window. Use when the crop region is calibrated and identical for every frame. |
+| `zero_pad_to_target(image, target_size)` | Strict centered zero-pad of a 2D image to `target_size × target_size`; raises if input is larger. |
+| `resize_diffraction_patterns(dp, target_n)` | Combined per-frame argmax-crop and zero-pad to `target_n × target_n`. Mask hot pixels first if the detector has saturated outliers. |
+
+### 3. Bad-pixel masking, inpainting & threshold cleanup
+
+| Function | Purpose |
+|---|---|
+| `mask_hot_pixels(arr, threshold, fill=0.0)` | Replace values above `threshold` with `fill`. **Mutates in place** and returns `arr`. |
+| `apply_intensity_floor(arr, threshold)` | Zero values strictly below `threshold` (noise-floor cutoff). Symmetric to `mask_hot_pixels`. **Mutates in place.** |
+| `inpaint_bad_pixels(arr, coords, radius=1)` | Replace each `(row, col)` in `coords` with the median of a `(2*radius+1)²` neighborhood. **Mutates in place.** |
+| `find_outlier_pixels(data, tolerance=3, worry_about_edges=True, get_fixed_image=False)` | Auto-detect hot/dead pixels via median-filter difference (`> 10·σ`). Returns coords; optionally also returns a fixed copy. |
+
+### 4. Intensity & geometric transforms
+
+| Function | Purpose |
+|---|---|
+| `normalize_intensity(arr, normalization, scale=1.0)` | Scale `arr` by `scale / normalization`. Match the per-dataset normalization the ViT model was trained with. |
+| `fourier_shift(images, shifts)` | Sub-pixel shift each `(H, W)` plane by `shifts[i] = (dy, dx)` via FFT phase-ramp multiplication. |
+| `compute_sample_pixel_size(wavelength_m, detector_distance_m, ccd_pixel_size_m, n_pixels)` | Far-field pixel size at the sample plane: `λ z / (N · dx_detector)`. |
+
+### How these map onto holoptycho's pipeline
+
+holoptycho currently runs equivalent inline code rather than importing
+from ptychoml — the helpers above were lifted from those inline copies.
+The map below shows where each one fits in the live streaming flow, so
+you can match a ptychoml function to its real-world call site:
+
+- **Per-frame** (`ImageBatchOp` in `holoptycho/preprocess.py`):
+  `crop_to_roi` for the detector window, then `mask_hot_pixels` with a
+  detector-specific saturation threshold.
+- **Per-batch** (`ImagePreprocessorOp`): `inpaint_bad_pixels` for known
+  bad-pixel coordinates, `apply_intensity_floor` for the optional noise
+  threshold. The same operator also runs inline `np.rot90`,
+  `np.fft.fftshift`, and `np.sqrt` for orientation and intensity →
+  amplitude conversion (numpy one-liners; not exposed as ptychoml
+  helpers).
+- **Inference** (`vit_inference.py` →
+  `ptychoml.PtychoViTInference.predict`): the diffraction amplitudes
+  produced above are the input to the ViT model.
+- **Post-inference** (`holoptycho/mosaic_stitch.py`): `fourier_shift`
+  places each predicted ViT patch at its sub-pixel scan position when
+  assembling the live mosaic.
+- **Replay scripts** (`holoptycho/scripts/replay_from_tiled.py`):
+  `auto_detect_roi_offsets` picks a sensible default ROI when no
+  user-supplied calibration is available.
+
+The remaining functions in this section
+(`resize_diffraction_patterns`, `mask_hot_pixels`,
+`compute_sample_pixel_size`, `estimate_roi`, `find_outlier_pixels`,
+`zero_pad_to_target`, `normalize_intensity`) come from offline tools
+(HXN h5_conv, ptycho_gui, ptycho-vit training data prep) and aren't
+called by holoptycho today.
+
 ## Run tests
 
 ```bash
