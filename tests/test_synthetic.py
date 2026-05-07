@@ -1,4 +1,4 @@
-"""Tests for ``ptychoml.testing`` and demonstrations of how to use it.
+"""Tests for ``tests/synthetic.py`` and demonstrations of how to use it.
 
 These exercises also serve as integration checks for the preprocessing
 utilities: a known synthetic pattern goes through ``resize_diffraction_patterns``
@@ -8,9 +8,11 @@ import numpy as np
 
 from ptychoml.preprocess import crop_to_roi, resize_diffraction_patterns
 from tests.synthetic import (
+    check_orientation,
     make_diffraction_pattern,
     make_test_object,
     make_test_pattern,
+    make_test_probe,
 )
 
 
@@ -132,3 +134,79 @@ def test_crop_to_roi_round_trip_with_synthetic_pattern():
     assert out.shape == (64, 64)
     peak = np.unravel_index(np.argmax(out), out.shape)
     assert peak == (32, 32)
+
+
+# ----- check_orientation ----------------------------------------------------
+
+def _make_consistent_triple(size=64, fftshift=True, intensity=False):
+    """Build a (diffraction, probe, object) triple that satisfies the forward model."""
+    probe = make_test_probe(size=size)
+    obj = make_test_object("asymmetric_L", size=size).astype(np.complex64)
+    exit_wave = probe * obj
+    diffraction = make_diffraction_pattern(
+        exit_wave, fftshift=fftshift, intensity=intensity
+    )
+    return diffraction, probe, obj
+
+
+def test_check_orientation_consistent_triple():
+    diffraction, probe, obj = _make_consistent_triple()
+    result = check_orientation(diffraction, probe, obj)
+    assert result["consistent"] is True
+    assert result["best_transform"] == "identity"
+    assert result["best_residual"] < 1e-5  # forward-model match is exact
+
+
+def test_check_orientation_detects_flip_y():
+    diffraction, probe, obj = _make_consistent_triple()
+    flipped = diffraction[::-1, :].copy()
+    result = check_orientation(flipped, probe, obj)
+    assert result["consistent"] is False
+    assert result["best_transform"] == "flip_y"
+
+
+def test_check_orientation_detects_transpose():
+    diffraction, probe, obj = _make_consistent_triple()
+    transposed = diffraction.T.copy()
+    result = check_orientation(transposed, probe, obj)
+    assert result["consistent"] is False
+    assert result["best_transform"] == "transpose"
+
+
+def test_check_orientation_intensity_mode():
+    """Forward model in intensity mode (|FFT|^2) is also self-consistent."""
+    diffraction, probe, obj = _make_consistent_triple(intensity=True)
+    result = check_orientation(diffraction, probe, obj, intensity=True)
+    assert result["consistent"] is True
+    assert result["best_transform"] == "identity"
+
+
+def test_check_orientation_unshifted():
+    """When the data isn't fftshifted, fftshift=False must be passed in."""
+    diffraction, probe, obj = _make_consistent_triple(fftshift=False)
+    # Wrong convention — flags inconsistency.
+    bad = check_orientation(diffraction, probe, obj, fftshift=True)
+    assert bad["consistent"] is False
+    # Right convention — passes.
+    good = check_orientation(diffraction, probe, obj, fftshift=False)
+    assert good["consistent"] is True
+
+
+def test_check_orientation_shape_mismatch_raises():
+    import pytest
+
+    diffraction = np.zeros((64, 64), dtype=np.float32)
+    probe = np.zeros((32, 32), dtype=np.complex64)
+    obj = np.zeros((64, 64), dtype=np.complex64)
+    with pytest.raises(ValueError, match="Shape mismatch"):
+        check_orientation(diffraction, probe, obj)
+
+
+def test_check_orientation_residual_dict_complete():
+    """All eight D4 transforms appear in residuals."""
+    diffraction, probe, obj = _make_consistent_triple()
+    result = check_orientation(diffraction, probe, obj)
+    assert set(result["residuals"]) == {
+        "identity", "flip_y", "flip_x", "rot90", "rot180", "rot270",
+        "transpose", "anti_transpose",
+    }
