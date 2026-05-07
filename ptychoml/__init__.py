@@ -1,12 +1,8 @@
 """Neural network inference for ptychography (PtychoViT TensorRT)."""
 from .inference import PtychoViTInference
 from .preprocess import (
-    adjust_object_for_pad,
-    apply_angle_correction_x,
     apply_intensity_floor,
-    array_ensure_positive_elements,
     auto_detect_roi_offsets,
-    compute_object_shape_from_scan,
     compute_sample_pixel_size,
     crop_to_roi,
     estimate_roi,
@@ -27,13 +23,9 @@ from .trt import (
 
 __all__ = [
     "PtychoViTInference",
-    "adjust_object_for_pad",
-    "apply_angle_correction_x",
     "apply_intensity_floor",
-    "array_ensure_positive_elements",
     "auto_detect_roi_offsets",
     "build_engine",
-    "compute_object_shape_from_scan",
     "compute_sample_pixel_size",
     "crop_to_roi",
     "estimate_roi",

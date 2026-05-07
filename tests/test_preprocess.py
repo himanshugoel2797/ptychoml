@@ -3,12 +3,8 @@ import numpy as np
 import pytest
 
 from ptychoml.preprocess import (
-    adjust_object_for_pad,
-    apply_angle_correction_x,
     apply_intensity_floor,
-    array_ensure_positive_elements,
     auto_detect_roi_offsets,
-    compute_object_shape_from_scan,
     compute_sample_pixel_size,
     crop_to_roi,
     estimate_roi,
@@ -72,37 +68,6 @@ def test_resize_diffraction_patterns_stacked_input():
     assert out.shape == (3, 256, 256)
     for i in range(3):
         assert out[i, 128, 128] == float(i + 1)
-
-
-# ----- adjust_object_for_pad ------------------------------------------------
-
-def test_adjust_object_for_pad_trim():
-    obj = np.ones((1, 100, 100), dtype=np.complex64)
-    # scale > 1 → trim by obj_pad*(scale-1) on each axis
-    out = adjust_object_for_pad(obj, scale_y=2.0, scale_x=2.0, obj_pad=10)
-    # corr = round(10 * 1.0) = 10, split 5/5 → trim 10 each axis
-    assert out.shape == (1, 90, 90)
-    # Center value preserved (still 1+0j).
-    assert out[0, 45, 45] == 1.0 + 0j
-
-
-def test_adjust_object_for_pad_pad():
-    obj = np.ones((1, 100, 100), dtype=np.complex64)
-    # scale < 1 → zero-pad
-    out = adjust_object_for_pad(obj, scale_y=0.5, scale_x=0.5, obj_pad=10)
-    # corr = round(10 * -0.5) = -5, pad 5 each axis (split 2/3)
-    assert out.shape == (1, 105, 105)
-    # Padded edges are zero.
-    assert out[0, 0, 0] == 0.0 + 0j
-    assert out[0, -1, -1] == 0.0 + 0j
-    # Original content preserved somewhere in the middle.
-    assert np.any(out[0] == 1.0 + 0j)
-
-
-def test_adjust_object_for_pad_noop():
-    obj = np.arange(1 * 4 * 5, dtype=np.complex64).reshape(1, 4, 5)
-    out = adjust_object_for_pad(obj, scale_y=1.0, scale_x=1.0, obj_pad=10)
-    np.testing.assert_array_equal(out, obj)
 
 
 # ----- mask_hot_pixels ------------------------------------------------------
@@ -219,62 +184,6 @@ def test_fourier_shift_zero_shift_is_identity():
     np.testing.assert_allclose(out, img, atol=1e-4)
 
 
-# ----- compute_object_shape_from_scan ---------------------------------------
-
-def test_compute_object_shape_from_scan_basic():
-    # 1 µm scan range, 5 nm pixel → 200 px scan + 180 probe + 30 pad = 410.
-    nx, ny = compute_object_shape_from_scan(
-        x_range_um=1.0, y_range_um=1.0,
-        nx_prb=180, ny_prb=180,
-        x_pixel_m=5e-9, y_pixel_m=5e-9,
-        obj_pad=30,
-    )
-    assert nx == 410
-    assert ny == 410
-    # Result must be even (FFT-friendly).
-    assert nx % 2 == 0
-    assert ny % 2 == 0
-
-
-def test_compute_object_shape_from_scan_rounds_up_to_even():
-    # 0.99 µm @ 5 nm → ceil = 198 px; +180 probe + 31 pad = 409 → 410.
-    nx, _ = compute_object_shape_from_scan(
-        x_range_um=0.99, y_range_um=0.99,
-        nx_prb=180, ny_prb=180,
-        x_pixel_m=5e-9, y_pixel_m=5e-9,
-        obj_pad=31,
-    )
-    assert nx % 2 == 0
-
-
-def test_compute_object_shape_from_scan_rejects_zero_pixel():
-    with pytest.raises(ValueError):
-        compute_object_shape_from_scan(
-            x_range_um=1.0, y_range_um=1.0,
-            nx_prb=180, ny_prb=180,
-            x_pixel_m=0.0, y_pixel_m=5e-9,
-            obj_pad=30,
-        )
-
-
-# ----- apply_angle_correction_x ---------------------------------------------
-
-def test_apply_angle_correction_x_uses_cos_below_45():
-    out = apply_angle_correction_x(10.0, angle_deg=30.0)
-    assert out == pytest.approx(10.0 * np.cos(np.deg2rad(30.0)))
-
-
-def test_apply_angle_correction_x_uses_sin_above_45():
-    out = apply_angle_correction_x(10.0, angle_deg=60.0)
-    assert out == pytest.approx(10.0 * np.sin(np.deg2rad(60.0)))
-
-
-def test_apply_angle_correction_x_array_input():
-    arr = np.array([1.0, 2.0, 3.0])
-    out = apply_angle_correction_x(arr, angle_deg=0.0)
-    np.testing.assert_allclose(out, arr)
-
-
 # ----- auto_detect_roi_offsets ----------------------------------------------
 
 def test_auto_detect_roi_offsets_finds_known_center():
@@ -349,29 +258,6 @@ def test_find_outlier_pixels_returns_fixed_image():
     _, fixed = find_outlier_pixels(img, get_fixed_image=True, worry_about_edges=False)
     # The hot pixel should be replaced with something near the local mean.
     assert abs(fixed[7, 7] - 100.0) < 10.0
-
-
-# ----- array_ensure_positive_elements ---------------------------------------
-
-def test_array_ensure_positive_elements_replaces_zeros():
-    arr = np.array([1.0, 0.0, 3.0, 0.0, 5.0], dtype=np.float64)
-    array_ensure_positive_elements(arr)
-    # Reverse-iteration: zero at idx 3 → 5; zero at idx 1 → 3.
-    np.testing.assert_array_equal(arr, np.array([1.0, 3.0, 3.0, 5.0, 5.0]))
-
-
-def test_array_ensure_positive_elements_no_op_for_all_positive():
-    arr = np.array([1.0, 2.0, 3.0], dtype=np.float64)
-    original = arr.copy()
-    array_ensure_positive_elements(arr)
-    np.testing.assert_array_equal(arr, original)
-
-
-def test_array_ensure_positive_elements_all_non_positive_is_noop():
-    arr = np.array([-1.0, -2.0, 0.0], dtype=np.float64)
-    original = arr.copy()
-    array_ensure_positive_elements(arr)
-    np.testing.assert_array_equal(arr, original)
 
 
 # ----- estimate_roi ---------------------------------------------------------

@@ -21,10 +21,12 @@ upstream file/function it was lifted from. Four upstreams contribute:
 * HXN h5_conv (offline HDF5-to-HDF5 converter, provided to this PR via a
   one-off ``temp_code`` script — not a public repo).
 
-Some functions are *variants* of each other (e.g. an HXN angle-correction
-routine that flips sign for ``angle <= -45°`` versus a holoptycho one that
-does not). They are kept side-by-side for now and will be deduped in a
-follow-up once the call sites are unified.
+Some functions are *variants* of each other (e.g. ``rm_outlier_pixels``
+takes parallel ``rows``/``cols`` arrays while ``inpaint_bad_pixels`` takes
+``(K, 2)`` coords; ``estimate_roi`` uses intensity projections while
+``auto_detect_roi_offsets`` uses centre-of-mass). They are kept side-by-
+side for now and will be deduped in a follow-up once call sites are
+unified.
 
 Per-frame argmax centering note
 -------------------------------
@@ -79,49 +81,6 @@ def resize_diffraction_patterns(dp: ArrayLike, target_n: int) -> np.ndarray:
         resized.append(pattern)
 
     return np.array(resized)
-
-
-def adjust_object_for_pad(
-    obj: np.ndarray,
-    scale_y: float,
-    scale_x: float,
-    obj_pad: int,
-) -> np.ndarray:
-    """Correct an object's last two axes after a pixel-grid rescale.
-
-    When an object is rescaled by ``(scale_y, scale_x)`` to match a new
-    diffraction-pattern pixel size, the per-axis padding region (which is
-    ``obj_pad`` pixels in the unscaled object) is also rescaled. Most
-    iterative ptycho backends, however, allocate a *fixed* ``obj_pad``
-    pixels of padding regardless of grid size, so the rescaled object
-    needs to be trimmed (``scale > 1``) or zero-padded (``scale < 1``) by
-    ``obj_pad * (scale - 1)`` pixels, split symmetrically across each
-    axis.
-
-    Source: HXN h5_conv ``adjust_obj_for_backend`` (provided via temp_code).
-    """
-    corr_h = int(round(obj_pad * (scale_y - 1)))
-    corr_w = int(round(obj_pad * (scale_x - 1)))
-
-    if corr_h > 0:
-        top = corr_h // 2
-        bot = corr_h - top
-        obj = obj[:, top:obj.shape[-2] - bot, :]
-    elif corr_h < 0:
-        pad = -corr_h
-        top = pad // 2
-        obj = np.pad(obj, ((0, 0), (top, pad - top), (0, 0)), mode="constant")
-
-    if corr_w > 0:
-        lft = corr_w // 2
-        rgt = corr_w - lft
-        obj = obj[:, :, lft:obj.shape[-1] - rgt]
-    elif corr_w < 0:
-        pad = -corr_w
-        lft = pad // 2
-        obj = np.pad(obj, ((0, 0), (0, 0), (lft, pad - lft)), mode="constant")
-
-    return obj
 
 
 def mask_hot_pixels(
@@ -245,53 +204,6 @@ def fourier_shift(images: np.ndarray, shifts: np.ndarray) -> np.ndarray:
 
     out = scipy.fft.ifft2(ft, workers=-1)
     return out.real.astype(images.dtype, copy=False)
-
-
-def compute_object_shape_from_scan(
-    x_range_um: float,
-    y_range_um: float,
-    nx_prb: int,
-    ny_prb: int,
-    x_pixel_m: float,
-    y_pixel_m: float,
-    obj_pad: int,
-) -> Tuple[int, int]:
-    """Compute the object array shape required to cover a scan region.
-
-    Adds the probe size and a fixed pad to the scan range expressed in
-    pixels, then rounds each dimension up to the next even integer so
-    downstream FFT-based kernels prefer real-FFT-friendly sizes.
-
-    Returns ``(nx_obj, ny_obj)``.
-
-    Source: holoptycho/streaming_recon.py
-    ``StreamingReconOp._required_object_shape`` (factored out of the
-    class so it doesn't depend on operator state).
-    """
-    if x_pixel_m <= 0 or y_pixel_m <= 0:
-        raise ValueError("Pixel sizes must be positive.")
-    nx_obj = int(nx_prb + np.ceil(abs(x_range_um) * 1e-6 / x_pixel_m) + obj_pad)
-    ny_obj = int(ny_prb + np.ceil(abs(y_range_um) * 1e-6 / y_pixel_m) + obj_pad)
-    nx_obj += nx_obj % 2
-    ny_obj += ny_obj % 2
-    return nx_obj, ny_obj
-
-
-def apply_angle_correction_x(value, angle_deg: float):
-    """Rescale an x-axis quantity (range or position) by the rotation angle.
-
-    Multiplies by ``|cos(angle)|`` for ``|angle| <= 45°`` and by
-    ``|sin(angle)|`` otherwise. ``value`` may be a scalar or an array;
-    returned as the same type. Does *not* apply the additional sign flip
-    used in some HXN flows for ``angle <= -45°``; callers needing that
-    should apply it separately.
-
-    Source: holoptycho/ptycho_holo.py ``X-axis rescale by rotation angle``
-    block (``self.angle_correction_flag`` branch).
-    """
-    if np.abs(angle_deg) <= 45.0:
-        return value * np.abs(np.cos(angle_deg * np.pi / 180.0))
-    return value * np.abs(np.sin(angle_deg * np.pi / 180.0))
 
 
 def auto_detect_roi_offsets(
@@ -425,44 +337,6 @@ def find_outlier_pixels(
 
         return hot_pixels, fixed_image
     return hot_pixels
-
-
-def array_ensure_positive_elements(arr: np.ndarray) -> None:
-    """Replace zero / negative values in a 1D array with the closest *following* positive value.
-
-    Iterates the array in reverse so a non-positive entry is filled with
-    the next valid value to its right (more likely to belong to the same
-    sub-scan than the preceding one). Mutates ``arr`` in place; returns
-    ``None``. If the array contains no positive values, it is left
-    unchanged — callers should validate ``np.any(arr > 0)`` themselves
-    when that matters.
-
-    Source: ptycho_gui/nsls2ptycho/core/HXN_databroker.py
-    ``array_ensure_positive_elements`` (upstream ``name`` parameter and
-    diagnostic prints dropped — library code should be quiet).
-    """
-    n_items_to_replace = int(np.sum(arr <= 0))
-    if not n_items_to_replace:
-        return
-
-    v_closest_positive = None
-    for v in np.flip(arr):
-        if v > 0:
-            v_closest_positive = v
-            break
-
-    if v_closest_positive is None:
-        return
-
-    n_replaced = 0
-    for n in reversed(range(arr.size)):
-        if arr[n] <= 0:
-            arr[n] = v_closest_positive
-            n_replaced += 1
-            if n_replaced == n_items_to_replace:
-                break
-        else:
-            v_closest_positive = arr[n]
 
 
 def _project_on_x(image: np.ndarray) -> np.ndarray:
