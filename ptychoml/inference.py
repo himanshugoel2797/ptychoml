@@ -63,6 +63,21 @@ class PtychoViTInference:
         self.expected_input_shape: Optional[Tuple[int, ...]] = None
         self.expected_output_shape: Optional[Tuple[int, ...]] = None
 
+        # Set in ``_init_engine`` if the engine was exported by
+        # ``convert_pt_to_onnx.py --probe ...``. Carries the complex probe
+        # baked into the ONNX graph as Constant nodes — the live
+        # orientation auto-detector reads this to enable forward-physics
+        # scoring without needing a sidecar file. ``None`` if the engine
+        # has only the primary output.
+        self.baked_probe: Optional[np.ndarray] = None
+
+        # Indices into ``trt_outputs`` for each named output. Set in
+        # ``_init_engine``; ``predict`` reads the primary one to skip the
+        # constant probe outputs that live next to it.
+        self._primary_output_idx = 0
+        self._probe_real_idx: Optional[int] = None
+        self._probe_imag_idx: Optional[int] = None
+
         # Stats
         self.n_batches = 0
 
@@ -87,14 +102,65 @@ class PtychoViTInference:
             self.trt_stream,
         ) = allocate_io_buffers(engine)
 
+        # The wrapper exported by ``convert_pt_to_onnx.py`` names its
+        # outputs ``"output"`` (the primary amp/phase prediction) and,
+        # optionally, ``"probe_real"`` + ``"probe_imag"`` (the baked
+        # complex probe split into float32 real/imag halves). Pick out
+        # those indices by name so the primary-output path doesn't have
+        # to assume position 0.
+        self._primary_output_idx = 0
+        self._probe_real_idx = None
+        self._probe_imag_idx = None
+        for i, out in enumerate(self.trt_outputs):
+            name = out.get("name", "")
+            if name == "probe_real":
+                self._probe_real_idx = i
+            elif name == "probe_imag":
+                self._probe_imag_idx = i
+            elif name == "output":
+                self._primary_output_idx = i
+
         self.expected_input_shape = tuple(self.trt_inputs[0]["shape"])
-        self.expected_output_shape = tuple(self.trt_outputs[0]["shape"])
+        self.expected_output_shape = tuple(
+            self.trt_outputs[self._primary_output_idx]["shape"]
+        )
         logger.info(
             "TRT engine loaded: %s | input=%s | output=%s",
             self.engine_path,
             self.expected_input_shape,
             self.expected_output_shape,
         )
+
+        # Extract the baked probe (if any) by running one zero-input
+        # forward pass. ``probe_real`` / ``probe_imag`` are Constant nodes
+        # in the ONNX graph so their values don't depend on the input;
+        # any forward pass populates them. Cached for the lifetime of the
+        # session — predict() then ignores those output bindings.
+        if (
+            self._probe_real_idx is not None
+            and self._probe_imag_idx is not None
+        ):
+            dummy = np.zeros(self.expected_input_shape, dtype=np.float32)
+            np.copyto(self.trt_inputs[0]["host"], dummy.ravel())
+            all_outputs = infer(
+                self.trt_context,
+                self.trt_inputs,
+                self.trt_outputs,
+                self.trt_bindings,
+                self.trt_stream,
+                cuda_context=self.cuda_ctx,
+            )
+            pr_shape = self.trt_outputs[self._probe_real_idx]["shape"]
+            pi_shape = self.trt_outputs[self._probe_imag_idx]["shape"]
+            pr = np.asarray(all_outputs[self._probe_real_idx]).reshape(pr_shape)
+            pi = np.asarray(all_outputs[self._probe_imag_idx]).reshape(pi_shape)
+            self.baked_probe = (pr + 1j * pi).astype(np.complex64)
+            logger.info(
+                "Extracted baked probe from engine: shape=%s dtype=%s",
+                self.baked_probe.shape,
+                self.baked_probe.dtype,
+            )
+
         self._initialized = True
 
     def predict(
@@ -164,7 +230,9 @@ class PtychoViTInference:
 
         model_input = np.ascontiguousarray(model_input, dtype=np.float32)
 
-        # Run inference
+        # Run inference. ``infer`` returns every output host buffer in
+        # binding order; for engines with a baked probe there are 3
+        # outputs and we want the primary one (the amp/phase prediction).
         np.copyto(self.trt_inputs[0]["host"], model_input.ravel())
         output_flat = np.array(
             infer(
@@ -174,7 +242,7 @@ class PtychoViTInference:
                 self.trt_bindings,
                 self.trt_stream,
                 cuda_context=self.cuda_ctx,
-            )[0]
+            )[self._primary_output_idx]
         )
 
         # Reshape output and strip padding

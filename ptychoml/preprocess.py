@@ -315,6 +315,41 @@ def mask_hot_pixels(
     return arr
 
 
+def mask_hot_pixels_by_count(
+    arr: np.ndarray,
+    count_threshold: float,
+    kind: str = "intensity",
+    fill: float = 0.0,
+) -> np.ndarray:
+    """Zero pixels whose photon count exceeds ``count_threshold``, in place.
+
+    The threshold is always specified in photon-count units. How it is
+    applied to ``arr`` depends on whether ``arr`` already represents counts
+    (``kind='intensity'``) or has been square-rooted to amplitude
+    (``kind='amplitude'``); in the latter case the comparison threshold is
+    ``sqrt(count_threshold)``. This lets the same caller-facing parameter
+    apply consistently whether the filter runs before or after a sqrt.
+
+    Pass ``count_threshold=None`` (or a non-finite value) to skip filtering
+    entirely — returns ``arr`` unchanged so callers can wire this in
+    unconditionally and gate via a single config field.
+
+    Source: ptycho-vit ``scripts/hxn_to_vit.py:_apply_hot_pixel_filter``.
+    """
+    if count_threshold is None or not np.isfinite(count_threshold):
+        return arr
+    if kind == "amplitude":
+        raw_threshold = float(np.sqrt(count_threshold))
+    elif kind == "intensity":
+        raw_threshold = float(count_threshold)
+    else:
+        raise ValueError(
+            f"kind must be 'amplitude' or 'intensity'; got {kind!r}"
+        )
+    arr[arr > raw_threshold] = fill
+    return arr
+
+
 def apply_intensity_floor(arr: np.ndarray, threshold: float) -> np.ndarray:
     """Zero values strictly below ``threshold`` (noise-floor cutoff), in place.
 
@@ -454,12 +489,58 @@ def normalize_intensity(
     """Scale ``arr`` by ``scale / normalization``.
 
     The PtychoViT model is trained with diffraction patterns rescaled by
-    a per-dataset ``(scale / normalization)`` factor; inference callers
-    must apply the same scaling. Returns a new array (does not mutate).
+    a per-dataset ``(scale / normalization)`` factor where
+    ``normalization`` is the max intensity across all DPs in the scan
+    (with hot pixels excluded). Inference callers must apply the same
+    scaling. Returns a new array (does not mutate).
+
+    See ``compute_intensity_normalization`` for the canonical way to
+    derive the ``normalization`` value from a DP stack.
 
     Source: ptycho-vit ``data.py:PtychographyDataset.normalize``.
     """
     return (arr / normalization) * scale
+
+
+def compute_intensity_normalization(
+    intensity: np.ndarray,
+    hot_pixel_count_threshold: float | None = None,
+) -> float:
+    """Return the per-scan normalization constant for ``preprocess_diffraction``.
+
+    Convention is "max intensity across the full DP stack, with hot
+    pixels excluded" — the same number ``hxn_to_vit.py`` writes per scan
+    into its ``{scan_id}_max_intensity.pkl``. Use this in offline
+    pipelines (and in the ``ptychoml-predict`` CLI) where the full stack
+    is in hand; in streaming mode where it is not, the caller should
+    supply the value out-of-band (e.g. from a scan-config JSON).
+
+    Args:
+        intensity:                  ``(..., H, W)`` raw detector counts.
+                                    May span the whole scan or a
+                                    representative subset.
+        hot_pixel_count_threshold:  Photon-count threshold above which
+                                    pixels are excluded from the max.
+                                    ``None`` includes everything; use it
+                                    when you know your data has no hot
+                                    pixels (e.g. a simulation).
+
+    Raises:
+        ValueError: every pixel exceeds the hot-pixel threshold.
+
+    Source: matches ``hxn_to_vit.py:write_outputs``'s running-max-after-
+    hot-pixel-filter behaviour.
+    """
+    arr = np.asarray(intensity)
+    if hot_pixel_count_threshold is None:
+        return float(arr.max())
+    mask = arr <= float(hot_pixel_count_threshold)
+    if not mask.any():
+        raise ValueError(
+            "All pixels exceed hot_pixel_count_threshold; cannot compute "
+            "normalization. Raise the threshold or check the data."
+        )
+    return float(arr[mask].max())
 
 
 def fourier_shift(images: np.ndarray, shifts: np.ndarray) -> np.ndarray:
@@ -491,6 +572,75 @@ def fourier_shift(images: np.ndarray, shifts: np.ndarray) -> np.ndarray:
     return out.real.astype(images.dtype, copy=False)
 
 
+# 8 D4 symmetries acting on the last two axes of an array. The keys match
+# the names used by the orientation auto-detector and by
+# ``ptycho-vit/scripts/hxn_to_vit.py`` so winning combinations can be
+# round-tripped through human-readable config or report files.
+D4_TRANSFORMS = {
+    'identity':      lambda a: a,
+    'fliplr':        lambda a: np.flip(a, axis=-1),
+    'flipud':        lambda a: np.flip(a, axis=-2),
+    'rot180':        lambda a: np.flip(np.flip(a, axis=-1), axis=-2),
+    'transpose':     lambda a: np.swapaxes(a, -1, -2),
+    'rot90_ccw':     lambda a: np.flip(np.swapaxes(a, -1, -2), axis=-2),
+    'rot90_cw':      lambda a: np.flip(np.swapaxes(a, -1, -2), axis=-1),
+    'antitranspose': lambda a: np.flip(np.flip(np.swapaxes(a, -1, -2), axis=-1), axis=-2),
+}
+
+D4_NAMES = tuple(D4_TRANSFORMS.keys())
+
+
+def apply_d4(arr: np.ndarray, name: str) -> np.ndarray:
+    """Apply a named D4 symmetry to the last two axes of ``arr``.
+
+    Returns a view where possible. The eight names are the standard D4
+    group elements: identity, the three axis-and-180° flips, and the four
+    transpose-based rotations and reflections. See ``D4_NAMES`` for the
+    full set.
+
+    Works on numpy and cupy arrays (both expose ``flip`` / ``swapaxes``).
+
+    Source: ptycho-vit ``scripts/hxn_to_vit.py:ORIENTATIONS``.
+    """
+    try:
+        fn = D4_TRANSFORMS[name]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown D4 transform: {name!r}; valid names are {D4_NAMES!r}"
+        ) from exc
+    return fn(arr)
+
+
+def remap_positions(
+    positions: np.ndarray,
+    signs: Tuple[int, int] = (1, 1),
+    swap_xy: bool = False,
+) -> np.ndarray:
+    """Apply a sign-and-swap remapping to scan positions.
+
+    ``positions`` is an ``(N, 2)`` array; column 0 is x, column 1 is y.
+    ``signs = (sx, sy)`` flips each axis independently (each must be ±1);
+    ``swap_xy`` exchanges the two columns. Returns a new array — the input
+    is not modified. Pairs with ``apply_d4`` for the orientation auto-
+    detector's search space: the same combination of sign-flip and
+    transpose must be applied consistently to detector data and scan
+    positions for the forward model to be self-consistent.
+
+    Source: ptycho-vit ``scripts/hxn_to_vit.py:POSITION_MAPS``.
+    """
+    sx, sy = signs
+    if sx not in (-1, 1) or sy not in (-1, 1):
+        raise ValueError(f"signs must each be ±1; got {signs!r}")
+    out = np.empty_like(positions)
+    if swap_xy:
+        out[:, 0] = sx * positions[:, 1]
+        out[:, 1] = sy * positions[:, 0]
+    else:
+        out[:, 0] = sx * positions[:, 0]
+        out[:, 1] = sy * positions[:, 1]
+    return out
+
+
 def compute_sample_pixel_size(
     wavelength_m: float,
     detector_distance_m: float,
@@ -505,3 +655,116 @@ def compute_sample_pixel_size(
     (provided via temp_code).
     """
     return wavelength_m * detector_distance_m / (n_pixels * ccd_pixel_size_m)
+
+
+# ============================================================================
+# 5. Composed pipeline
+# ----------------------------------------------------------------------------
+# A single entry point that composes the individual utilities above in the
+# order ptycho-vit applies them during training. Callers wire this in once
+# and configure behaviour via the parameters rather than re-implementing the
+# sequence each time. Geometric site-specific transforms (axis flips,
+# rotations, transposes) are intentionally NOT part of this — they belong to
+# the caller because each beamline lays out its detector differently.
+# ============================================================================
+
+
+def preprocess_diffraction(
+    intensity: np.ndarray,
+    *,
+    normalization: float,
+    scale: float = 10000.0,
+    hot_pixel_count_threshold: float | None = None,
+    bad_pixel_coords=None,
+    bad_pixel_inpaint_radius: int = 1,
+    dp_orient: str = 'identity',
+    fftshift: bool = False,
+    out_dtype=np.float32,
+) -> np.ndarray:
+    """Convert raw detector intensity to a model-ready diffraction amplitude.
+
+    Composes the ptycho-vit training-time preprocessing on a batch of raw
+    detector frames. Steps run in this order:
+
+      1. ``inpaint_bad_pixels`` (if ``bad_pixel_coords`` is given)
+      2. ``mask_hot_pixels_by_count`` (intensity-domain comparison)
+      3. ``(intensity / normalization) * scale``  (matches training scale)
+      4. ``sqrt`` (intensity → amplitude)
+      5. ``apply_d4`` (rotate/flip the detector frame into the model frame)
+      6. ``fftshift`` on the last two axes (optional)
+
+    The first two steps mutate a working copy so the caller's input is not
+    modified. Steps 3–6 allocate a new float array of ``out_dtype``.
+
+    Args:
+        intensity:                  Raw detector counts, shape ``(..., H, W)``.
+                                    May be any numeric dtype; the working
+                                    copy is promoted to float64 before
+                                    rescaling and cast to ``out_dtype`` at
+                                    the end.
+        normalization:              Per-scan max intensity (hot pixels
+                                    excluded) — what ptycho-vit's training
+                                    pipeline divides DPs by to land them on
+                                    the model's amplitude scale. Compute
+                                    with ``compute_intensity_normalization``
+                                    when the full DP stack is in hand
+                                    (offline / CLI). In streaming mode where
+                                    it is not, take the value from the scan
+                                    config and pass it in.
+        scale:                      Global scale factor (10000.0 in
+                                    ptycho-vit's default config).
+        hot_pixel_count_threshold:  Photon-count threshold; pixels strictly
+                                    above this are zeroed before rescaling.
+                                    ``None`` disables the filter.
+        bad_pixel_coords:           Optional ``(K, 2)`` array of known bad
+                                    ``(row, col)`` locations to median-fill
+                                    before the hot-pixel mask runs.
+        bad_pixel_inpaint_radius:   Window radius for the median fill.
+        dp_orient:                  D4 transform name (see ``D4_NAMES``)
+                                    that rotates/flips the detector frame
+                                    into the orientation the ViT model
+                                    expects. ``'identity'`` is a no-op.
+                                    Pick by hand from a known config, or
+                                    let the orientation auto-detector pick
+                                    one and pass the winning name here.
+        fftshift:                   If True, apply ``np.fft.fftshift`` on
+                                    the last two axes after the D4
+                                    transform. Off by default because the
+                                    right DC convention is caller- and
+                                    model-specific; pick the one that
+                                    matches your training data.
+        out_dtype:                  Output dtype. Default ``float32``,
+                                    matching the ONNX/TRT engine's expected
+                                    input dtype.
+
+    Returns:
+        Amplitude array shape ``intensity.shape`` and dtype ``out_dtype``.
+
+    Source: composes utilities lifted from ptycho-vit ``data.py:normalize``
+    + ``data.py:_load_hdf5_pattern`` (sqrt + zero-pad omitted; padding is a
+    spatial concern handled separately) and ``hxn_to_vit.py``'s hot-pixel
+    filter + D4 sweep.
+    """
+    working = np.asarray(intensity).copy()
+
+    if bad_pixel_coords is not None and len(np.asarray(bad_pixel_coords)) > 0:
+        inpaint_bad_pixels(
+            working, bad_pixel_coords, radius=bad_pixel_inpaint_radius,
+        )
+
+    if hot_pixel_count_threshold is not None:
+        mask_hot_pixels_by_count(
+            working, hot_pixel_count_threshold, kind="intensity",
+        )
+
+    amplitude = np.sqrt(
+        (working.astype(np.float64) / float(normalization)) * float(scale)
+    ).astype(out_dtype, copy=False)
+
+    if dp_orient != 'identity':
+        amplitude = apply_d4(amplitude, dp_orient)
+
+    if fftshift:
+        amplitude = np.fft.fftshift(amplitude, axes=(-2, -1))
+
+    return np.ascontiguousarray(amplitude)

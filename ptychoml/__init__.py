@@ -1,8 +1,18 @@
 """Neural network inference for ptychography (PtychoViT TensorRT)."""
 from .inference import PtychoViTInference
+from .orientation import (
+    OrientationCandidate,
+    OrientationReport,
+    OrientationResult,
+    autodetect_orientation,
+)
 from .preprocess import (
+    D4_NAMES,
+    D4_TRANSFORMS,
+    apply_d4,
     apply_intensity_floor,
     auto_detect_roi_offsets,
+    compute_intensity_normalization,
     compute_sample_pixel_size,
     crop_to_roi,
     estimate_roi,
@@ -10,7 +20,10 @@ from .preprocess import (
     fourier_shift,
     inpaint_bad_pixels,
     mask_hot_pixels,
+    mask_hot_pixels_by_count,
     normalize_intensity,
+    preprocess_diffraction,
+    remap_positions,
     resize_diffraction_patterns,
     zero_pad_to_target,
 )
@@ -21,10 +34,18 @@ from .trt import (
 )
 
 __all__ = [
+    "D4_NAMES",
+    "D4_TRANSFORMS",
+    "OrientationCandidate",
+    "OrientationReport",
+    "OrientationResult",
     "PtychoViTInference",
+    "autodetect_orientation",
+    "apply_d4",
     "apply_intensity_floor",
     "auto_detect_roi_offsets",
     "build_engine",
+    "compute_intensity_normalization",
     "compute_sample_pixel_size",
     "crop_to_roi",
     "estimate_roi",
@@ -33,7 +54,10 @@ __all__ = [
     "inpaint_bad_pixels",
     "load_engine",
     "mask_hot_pixels",
+    "mask_hot_pixels_by_count",
     "normalize_intensity",
+    "preprocess_diffraction",
+    "remap_positions",
     "resize_diffraction_patterns",
     "save_engine",
     "zero_pad_to_target",
